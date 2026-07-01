@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Upload - Pose Search App</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <nav class="navbar">
+    <div class="nav-container">
+      <a href="/" class="nav-title">Pose Search</a>
+      <div class="nav-links">
+        <a href="/" class="nav-link">Search</a>
+        <a href="/upload" class="nav-link active">Upload</a>
+      </div>
+    </div>
+  </nav>
+  <main class="container">
+    <h1>Upload Images</h1>
+    <p>Upload images of people to add to the pose database index.</p>
+    <form id="upload-form">
+      <input type="file" id="image-input" accept="image/*" />
+      <button type="submit">Upload & Index</button>
+    </form>
+    <div class="button-group">
+      <button id="clear-btn" class="btn-danger">Clear Index</button>
+    </div>
+    <section id="result" class="hidden">
+      <h2>Upload Successful</h2>
+      <p id="result-message"></p>
+    </section>
+    <section id="error" class="hidden"></section>
+  </main>
+  <script src="/static/upload.js"></script>
+</body>
+</html>

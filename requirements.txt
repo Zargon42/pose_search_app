@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+jinja2
+pillow
+python-multipart
+mediapipe
+numpy
+requests

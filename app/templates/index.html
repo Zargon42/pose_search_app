@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Pose Search App</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <nav class="navbar">
+    <div class="nav-container">
+      <a href="/" class="nav-title">Pose Search</a>
+      <div class="nav-links">
+        <a href="/" class="nav-link active">Search</a>
+        <a href="/upload" class="nav-link">Upload</a>
+      </div>
+    </div>
+  </nav>
+  <main class="container">
+    <h1>Pose Search</h1>
+    <p>Upload an image of a person and find the closest pose match from the indexed database.</p>
+    <form id="upload-form">
+      <input type="file" id="image-input" accept="image/*" />
+      <button type="submit">Search</button>
+    </form>
+    <section id="result" class="hidden">
+      <h2>Search Results</h2>
+      <div class="results-container">
+        <div class="result-column">
+          <h3>Your Image</h3>
+          <img id="uploaded-image" src="" alt="Uploaded image" />
+        </div>
+        <div class="result-column">
+          <h3>Best Match</h3>
+          <img id="result-image" src="" alt="Best match" />
+          <p id="result-file"></p>
+          <p id="result-distance"></p>
+        </div>
+      </div>
+    </section>
+    <section id="error" class="hidden"></section>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>
