@@ -6,3 +6,4 @@ python-multipart
 mediapipe
 numpy
 requests
+playwright
