@@ -49,6 +49,9 @@ def extract_pose_vector_bizarre(image: Image.Image) -> Optional[np.ndarray]:
     try:
         image.save(tmp_path)
 
+        env = os.environ.copy()
+        env.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
+
         cmd = [sys.executable, "-m", "_scripts.pose_estimator", str(tmp_path), model_path]
         try:
             proc = subprocess.run(
@@ -57,7 +60,8 @@ def extract_pose_vector_bizarre(image: Image.Image) -> Optional[np.ndarray]:
                 capture_output=True,
                 text=True,
                 check=True,
-                timeout=120,
+                timeout=240,
+                env=env,
             )
         except subprocess.CalledProcessError as e:
             raise RuntimeError(f"bizarre estimator failed: {e.stderr}") from e
