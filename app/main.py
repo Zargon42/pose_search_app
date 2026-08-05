@@ -1,4 +1,6 @@
 import json #interpret json files
+import logging
+import os
 import numpy as np #vector math
 import uuid  # generate unique filenames
 import shutil  # for removing directories
@@ -13,6 +15,9 @@ from PIL import Image # handle image files
 # from mediapipe.tasks.python import vision
 
 import mediapipe as mp # import mediapipe to use the pose detection model
+
+logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent # get the base directory of the project
 
@@ -65,6 +70,23 @@ def normalize_pose(coords: np.ndarray) -> np.ndarray: # normalize the pose coord
 
 
 def extract_pose_vector(image: Image.Image) -> np.ndarray | None:
+    # If user configured a bizarre estimator model via env var, try that first.
+    try:
+        if os.environ.get("BIZARRE_MODEL"):
+            logger.info("Bizarre estimator requested via BIZARRE_MODEL")
+            from .pose_detector import extract_pose_vector_bizarre
+            try:
+                vec = extract_pose_vector_bizarre(image)
+                if vec is not None:
+                    logger.info("Using bizarre-pose-estimator output")
+                    return vec
+                logger.warning("Bizarre estimator returned no pose; falling back to MediaPipe")
+            except Exception as exc:
+                logger.warning(f"Bizarre estimator failed: {exc}. Falling back to MediaPipe.")
+    except Exception as exc:
+        logger.warning(f"Error loading bizarre estimator: {exc}. Falling back to MediaPipe.")
+
+    logger.info("Using MediaPipe pose extractor")
     base_options = mp.tasks.BaseOptions(model_asset_path=model_path)
     options = mp.tasks.vision.PoseLandmarkerOptions(
         base_options=base_options,

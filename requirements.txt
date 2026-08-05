@@ -7,3 +7,14 @@ mediapipe
 numpy
 requests
 playwright
+# Dependencies commonly required by the bizarre-pose-estimator upstream project.
+# Some are GPU/torch-version specific; install detectron2 separately if needed.
+torch>=1.8.1
+torchvision
+pytorch-lightning>=1.3.8
+kornia>=0.6.2
+opencv-contrib-python>=4.13.0.92
+scikit-image>=0.20.0
+scikit-learn>=1.2.0
+wandb>=0.15.0
+# Optional (platform/GPU-specific): detectron2 — follow upstream install instructions
