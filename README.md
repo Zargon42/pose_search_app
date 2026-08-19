@@ -7,7 +7,7 @@ Theoretically this app can be used for any generic pose detection case. My perso
 
 
 # TO DO
-- Implement pose detection model that can handle poses present in drawn or artistic images
+- Implement pose detection model that can better handle poses present in drawn or artistic images
 - Implement effective manga panel segmentation algorithm to extract individual panels from the Manga volumes of choice and populate the database
 - Implement detection for multiple subjects within an image, currently mediapipe can only handle single persons.
 - Add a "suggest pose" page which will return a pose image from the database for the user to replicate.
