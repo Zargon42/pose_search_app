@@ -13,7 +13,7 @@ from fastapi.templating import Jinja2Templates
 from PIL import Image, ImageOps, UnidentifiedImageError
 
 from .page_segmentation import MAX_PANELS, segment_panels
-from .pose_detector import _pose_detector, extract_pose_detections
+from .pose_detector import _manga_pose_detector, _pose_detector, extract_pose_detections
 from .pose_detector import normalize_pose as _normalize_pose
 
 
@@ -155,7 +155,7 @@ def _page_detections(
     for panel_index, bounds in enumerate(panels):
         left, top, right, bottom = bounds
         crop = image.crop(bounds)
-        for vector, local_bounds in extract_pose_detections(crop):
+        for vector, local_bounds in extract_pose_detections(crop, manga=True):
             x0, y0, x1, y1 = local_bounds
             pose_bounds = [
                 left + round(x0 * (right - left)),
@@ -196,6 +196,7 @@ async def lifespan(_: FastAPI):
     _pose_detector.warm_up()
     yield
     _pose_detector.close()
+    _manga_pose_detector.close()
 
 
 app = FastAPI(title="Pose Search App", lifespan=lifespan)

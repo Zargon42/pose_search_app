@@ -9,6 +9,8 @@ from PIL import Image
 MODEL_PATH = Path(__file__).resolve().parent / "pose_landmarker.task"
 MAX_POSES = 8
 MAX_IMAGE_SIDE = 1280
+PHOTO_POSE_CONFIDENCE = 0.3
+MANGA_POSE_CONFIDENCE = 0.1
 
 
 def normalize_pose(coords: np.ndarray) -> np.ndarray:
@@ -22,9 +24,29 @@ def normalize_pose(coords: np.ndarray) -> np.ndarray:
     return coords.flatten()
 
 
+def _box_iou(
+    first: tuple[float, float, float, float],
+    second: tuple[float, float, float, float],
+) -> float:
+    left = max(first[0], second[0])
+    top = max(first[1], second[1])
+    right = min(first[2], second[2])
+    bottom = min(first[3], second[3])
+    intersection = max(0.0, right - left) * max(0.0, bottom - top)
+    first_area = max(0.0, first[2] - first[0]) * max(0.0, first[3] - first[1])
+    second_area = max(0.0, second[2] - second[0]) * max(0.0, second[3] - second[1])
+    union = first_area + second_area - intersection
+    return intersection / union if union > 0 else 0.0
+
+
 class PoseDetector:
-    def __init__(self, model_path: Path = MODEL_PATH) -> None:
+    def __init__(
+        self,
+        model_path: Path = MODEL_PATH,
+        pose_confidence: float = PHOTO_POSE_CONFIDENCE,
+    ) -> None:
         self._model_path = model_path
+        self._pose_confidence = pose_confidence
         self._detector = None
         self._lock = threading.Lock()
 
@@ -35,8 +57,8 @@ class PoseDetector:
             options = mp.tasks.vision.PoseLandmarkerOptions(
                 base_options=mp.tasks.BaseOptions(model_asset_path=str(self._model_path)),
                 num_poses=MAX_POSES,
-                min_pose_detection_confidence=0.3,
-                min_pose_presence_confidence=0.3,
+                min_pose_detection_confidence=self._pose_confidence,
+                min_pose_presence_confidence=self._pose_confidence,
                 output_segmentation_masks=False,
             )
             self._detector = mp.tasks.vision.PoseLandmarker.create_from_options(options)
@@ -57,7 +79,7 @@ class PoseDetector:
         with self._lock:
             result = self._get_detector().detect(mp_image)
 
-        detections = []
+        candidates = []
         for landmarks in result.pose_landmarks or []:
             coords = np.array([(landmark.x, landmark.y) for landmark in landmarks], dtype=np.float32)
             bounds = (
@@ -66,7 +88,17 @@ class PoseDetector:
                 float(np.clip(coords[:, 0].max(), 0, 1)),
                 float(np.clip(coords[:, 1].max(), 0, 1)),
             )
-            detections.append((normalize_pose(coords), bounds))
+            visibility = float(np.mean([landmark.visibility for landmark in landmarks]))
+            candidates.append((visibility, normalize_pose(coords), bounds))
+
+        candidates.sort(key=lambda candidate: candidate[0], reverse=True)
+        detections = []
+        kept_bounds = []
+        for _, vector, bounds in candidates:
+            if any(_box_iou(bounds, kept) > 0.55 for kept in kept_bounds):
+                continue
+            detections.append((vector, bounds))
+            kept_bounds.append(bounds)
         return detections
 
     def close(self) -> None:
@@ -77,12 +109,15 @@ class PoseDetector:
 
 
 _pose_detector = PoseDetector()
+_manga_pose_detector = PoseDetector(pose_confidence=MANGA_POSE_CONFIDENCE)
 
 
 def extract_pose_detections(
     image: Image.Image,
+    manga: bool = False,
 ) -> list[tuple[np.ndarray, tuple[float, float, float, float]]]:
-    return _pose_detector.detect(image)
+    detector = _manga_pose_detector if manga else _pose_detector
+    return detector.detect(image)
 
 
 def extract_pose_vectors(image: Image.Image) -> list[np.ndarray]:

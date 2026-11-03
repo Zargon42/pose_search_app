@@ -4,8 +4,8 @@ from PIL import Image
 
 MAX_SEGMENTATION_SIDE = 1600
 MAX_PANELS = 40
-INK_THRESHOLD = 245
-MAX_GUTTER_INK_RATIO = 0.005
+INK_THRESHOLD = 230
+MAX_GUTTER_INK_RATIO = 0.08
 
 
 def _candidate_cut(
@@ -19,7 +19,7 @@ def _candidate_cut(
 
     occupancy = ink.mean(axis=1 if horizontal else 0)
     is_gutter = occupancy <= MAX_GUTTER_INK_RATIO
-    minimum_length = max(4, round(min(height, width) * 0.012))
+    minimum_length = max(3, round(min(height, width) * 0.004))
 
     candidates = []
     start = None

@@ -25,6 +25,19 @@ def make_grid_page(rows: int = 2, columns: int = 2) -> Image.Image:
     return image
 
 
+def make_page_with_narrow_gray_gutter() -> Image.Image:
+    image = Image.new("RGB", (659, 1024), "white")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((20, 20, 390, 420), fill=(200, 200, 200))
+    draw.rectangle((408, 20, 650, 420), fill=(200, 200, 200))
+    draw.rectangle((20, 455, 650, 1000), fill=(200, 200, 200))
+    draw.rectangle((391, 20, 407, 420), fill=(235, 235, 235))
+    for y in range(433, 450):
+        for x in range(0, 659, 50):
+            draw.point((x, y), fill="black")
+    return image
+
+
 class PanelSegmentationTests(unittest.TestCase):
     def test_splits_regular_page_gutters(self):
         panels = segment_panels(make_grid_page())
@@ -38,6 +51,17 @@ class PanelSegmentationTests(unittest.TestCase):
         panels = segment_panels(make_grid_page(rows=3, columns=3), max_panels=4)
 
         self.assertEqual(len(panels), 4)
+
+    def test_splits_narrow_gray_vertical_gutter_and_noisy_horizontal_gutter(self):
+        panels = segment_panels(make_page_with_narrow_gray_gutter())
+
+        self.assertEqual(len(panels), 3)
+        upper_panels = sorted(
+            (panel for panel in panels if panel[1] == 0),
+            key=lambda panel: panel[0],
+        )
+        self.assertEqual(len(upper_panels), 2)
+        self.assertLessEqual(upper_panels[0][2], upper_panels[1][0])
 
     def test_blank_page_is_one_panel(self):
         image = Image.new("RGB", (120, 200), "white")
