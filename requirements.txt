@@ -8,3 +8,6 @@ numpy
 requests
 playwright
 pypdfium2
+rtmlib==0.0.16
+onnxruntime>=1.18,<2
+opencv-python>=4.8,<5

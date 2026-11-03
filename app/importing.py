@@ -90,6 +90,57 @@ class ImportManager:
             self.events[job_id] = event
         self.executor.submit(self._run, job_id, files, directory, event)
 
+    def start_redetection(self, job_id, panel_ids):
+        event = threading.Event()
+        with self.lock:
+            self.events[job_id] = event
+        self.executor.submit(self._redetect, job_id, panel_ids, event)
+
+    def _redetect(self, job_id, panel_ids, event):
+        catalog = self.catalog
+        image, page_id = None, None
+        completed_pages, updated, warnings = set(), 0, []
+        try:
+            catalog.update_job(job_id, status="running")
+            for index, panel_id in enumerate(panel_ids):
+                if event.is_set():
+                    raise ImportCancelled()
+                try:
+                    original = catalog.panel(panel_id)
+                    if original["page_id"] != page_id:
+                        if image is not None:
+                            image.close()
+                        page = catalog.page(original["page_id"])
+                        image = open_image(catalog.assets / page["image_name"])
+                        page_id = original["page_id"]
+                    catalog.update_job(job_id, current=f"{original['source_name']} · page {original['page_number']}")
+                    candidate = panel_candidates(image, [original["bounds"]], cancelled=event.is_set)[0]
+                    if event.is_set():
+                        raise ImportCancelled()
+                    if catalog.replace_unreviewed(original, candidate):
+                        updated += 1
+                    completed_pages.add(page_id)
+                except ImportCancelled:
+                    raise
+                except Exception as exc:
+                    warnings.append(f"Panel {panel_id}: {exc}")
+                catalog.update_job(job_id, files_done=index + 1, pages_done=len(completed_pages),
+                                   panel_count=updated, warnings=warnings[-100:])
+            with self.lock:
+                status = "failed" if warnings and not updated else "completed"
+                catalog.update_job(job_id, status="cancelled" if event.is_set() else status, current="",
+                                   error="No panels could be re-detected. Check the warnings." if status == "failed" else "")
+        except ImportCancelled:
+            catalog.update_job(job_id, status="cancelled", current="")
+        except Exception as exc:
+            logger.exception("Re-detection %s failed", job_id)
+            catalog.update_job(job_id, status="failed", error=str(exc), current="")
+        finally:
+            if image is not None:
+                image.close()
+            with self.lock:
+                self.events.pop(job_id, None)
+
     def cancel(self, job_id):
         with self.lock:
             event = self.events.get(job_id)

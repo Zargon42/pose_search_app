@@ -30,6 +30,8 @@
         <div class="actions"><button id="import-button" type="submit">Import & find panels</button></div>
       </form>
       <p id="upload-status" role="status"></p>
+      <div class="actions"><button id="redetect-collection" type="button" class="secondary">Re-detect unreviewed panels</button></div>
+      <p class="small muted">Use the improved drawing detector on existing crops. Accepted, skipped, tagged, and newly corrected panels are kept.</p>
     </section>
     <section id="jobs-section" class="surface hidden" aria-label="Import progress"><h2>Imports</h2><div id="jobs-list" aria-live="polite"></div></section>
   </div>
@@ -53,7 +55,8 @@
       <fieldset><legend>Figures</legend>
         <label>Selected skeleton<select id="pose-select"></select></label>
         <div class="actions"><button id="add-pose" type="button" class="secondary">Add skeleton</button><button id="remove-pose" type="button" class="danger-link">Remove skeleton</button></div>
-        <details><summary>Edit joint coordinates</summary><label>Joint<select id="joint-select"></select></label><div class="bounds-grid"><label>X<input id="joint-x" type="number" step="any"></label><label>Y<input id="joint-y" type="number" step="any"></label></div><button id="set-joint" type="button" class="secondary">Set joint</button></details>
+        <label class="toggle"><input id="show-uncertain" type="checkbox">Show uncertain joints</label>
+        <details><summary>Edit joint coordinates</summary><label>Joint<select id="joint-select"></select></label><p id="joint-confidence" class="small muted"></p><div class="bounds-grid"><label>X<input id="joint-x" type="number" step="any"></label><label>Y<input id="joint-y" type="number" step="any"></label></div><button id="set-joint" type="button" class="secondary">Set joint</button></details>
       </fieldset>
       <label>Total people in panel<input id="participant-count" type="number" min="0" max="64" required></label>
       <div id="gender-tags" class="tag-grid"></div><p class="small muted">Tags describe characters. Unknown stays unknown until you choose a tag.</p>

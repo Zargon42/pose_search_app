@@ -3,6 +3,8 @@ import { api, el, genderLabels, jsonOptions, panelCard } from './common.js';
 const $ = id => document.getElementById(id);
 const activeStatuses = new Set(['queued', 'running', 'cancelling']);
 const supported = /\.(pdf|zip|cbz|jpg|jpeg|png|webp|bmp|gif|tif|tiff)$/i;
+const jointThreshold = .35;
+const bodyJoints = [11,12,13,14,15,16,23,24,25,26,27,28];
 let datasets = [], selectedDataset = '', editingDataset = null, offset = 0, total = 0, pollTimer;
 let datasetRequest = 0, panelRequest = 0;
 let editor = null, pageImage = null, poseDirty = false, drawCrop = false, pointer = null;
@@ -111,6 +113,17 @@ $('import-form').addEventListener('submit', event => {
   });
 });
 
+$('redetect-collection').addEventListener('click', () => run(async () => {
+  if (!confirm('Replace automatic skeletons in unreviewed panels using the improved drawing detector? Accepted, skipped, tagged, and newly corrected panels are kept. Previously edited pending panels without tags or notes may also be replaced. A local catalog backup is saved first.')) return;
+  clearError(); $('redetect-collection').disabled = true;
+  $('upload-status').textContent = 'Preparing the drawing detector…';
+  try {
+    await api(`/api/datasets/${selectedDataset}/redetect`, { method: 'POST' });
+    $('upload-status').textContent = 'Re-detection queued. Existing crops are reused; completed panels are saved as the job progresses.';
+    await loadJobs();
+  } finally { $('redetect-collection').disabled = false; }
+}));
+
 async function loadJobs() {
   clearTimeout(pollTimer);
   if (!selectedDataset) { $('jobs-section').classList.add('hidden'); return; }
@@ -121,10 +134,12 @@ async function loadJobs() {
   $('jobs-list').replaceChildren();
   jobs.forEach(job => {
     const item = el('div', undefined, 'job');
-    item.append(el('strong', job.status[0].toUpperCase() + job.status.slice(1)), el('p', `${job.files_done}/${job.total_files} files · ${job.pages_done}/${job.total_pages} discovered pages · ${job.panel_count} panels`, 'small'));
+    const redoing = job.kind === 'redetect';
+    item.append(el('strong', `${redoing ? 'Re-detection · ' : ''}${job.status[0].toUpperCase() + job.status.slice(1)}`),
+      el('p', redoing ? `${job.files_done}/${job.total_files} panels processed · ${job.panel_count} updated` : `${job.files_done}/${job.total_files} files · ${job.pages_done}/${job.total_pages} discovered pages · ${job.panel_count} panels`, 'small'));
     if (activeStatuses.has(job.status)) {
       const progress = el('progress'); progress.max = Math.max(1, job.total_files); progress.value = job.files_done;
-      progress.setAttribute('aria-label', 'Import files completed'); item.append(progress);
+      progress.setAttribute('aria-label', redoing ? 'Panels processed' : 'Import files completed'); item.append(progress);
       if (job.current) item.append(el('p', job.current, 'small source'));
       const cancel = el('button', job.status === 'cancelling' ? 'Stopping after current panel…' : 'Cancel import', 'secondary');
       cancel.disabled = job.status === 'cancelling';
@@ -171,6 +186,7 @@ async function openPanel(id) {
   const image = new Image();
   await new Promise((resolve, reject) => { image.onload = resolve; image.onerror = () => reject(new Error('Source page could not be loaded.')); image.src = panel.page_url; });
   editor = panel; pageImage = image; poseDirty = false; drawCrop = false;
+  $('show-uncertain').checked = false;
   $('draw-crop').textContent = 'Draw crop';
   $('review-source').textContent = `${panel.dataset_name} · ${panel.source_name} · page ${panel.page_number} · ${panel.status}`;
   setBounds(panel.bounds); $('participant-count').value = panel.participant_count; $('panel-notes').value = panel.notes;
@@ -193,13 +209,19 @@ $('participant-count').addEventListener('input', () => renderGenders([...documen
 
 function renderPoses(prefer = 0) {
   $('pose-select').replaceChildren();
-  editor.poses.forEach((pose, index) => { const option = el('option', `Figure ${index + 1}${pose.joints ? '' : ' (re-detect to edit)'}`); option.value = index; $('pose-select').append(option); });
+  editor.poses.forEach((pose, index) => {
+    const visible = bodyJoints.filter(joint => (pose.joint_scores?.[joint] ?? 1) >= jointThreshold).length;
+    const option = el('option', `Figure ${index + 1}${pose.joints ? ` · ${visible}/12 body joints` : ' (re-detect to edit)'}`);
+    option.value = index; $('pose-select').append(option);
+  });
   if (!editor.poses.length) { const option = el('option', 'No skeletons detected'); option.value = ''; $('pose-select').append(option); }
   else $('pose-select').value = Math.min(prefer, editor.poses.length - 1);
   $('remove-pose').disabled = !editor.poses.length;
   $('editor-hint').textContent = editor.poses.some(pose => !pose.joints)
     ? 'Migrated vectors are preserved. Re-detect to get editable joints, or remove the old skeleton and add one manually.'
-    : 'Drag a joint to correct it. Use Draw crop to mark a different panel rectangle; you can also enter coordinates.';
+    : editor.poses.some(pose => pose.backend === 'legacy' || pose.backend === 'mediapipe-photo')
+      ? 'These results used the older detector. Re-detect this panel to replace them, or correct the joints manually.'
+      : 'Only confident joints are shown. Drag to correct a joint; Show uncertain joints reveals hidden estimates. Crop coordinates are editable.';
   syncJointFields();
 }
 
@@ -207,6 +229,8 @@ function syncJointFields() {
   const joints = selectedPose()?.joints;
   const joint = joints?.[Number($('joint-select').value)];
   $('joint-x').value = joint?.[0] ?? ''; $('joint-y').value = joint?.[1] ?? '';
+  const score = selectedPose()?.joint_scores?.[Number($('joint-select').value)];
+  $('joint-confidence').textContent = score === undefined ? '' : `Joint score: ${score.toFixed(2)}. Setting coordinates marks this joint as trusted.`;
   $('set-joint').disabled = !joint;
 }
 $('pose-select').addEventListener('change', () => { syncJointFields(); draw(); });
@@ -215,8 +239,12 @@ $('set-joint').addEventListener('click', () => {
   if (!selectedPose()?.joints) return;
   const x = Number($('joint-x').value), y = Number($('joint-y').value);
   if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || y < 0 || x > editor.width || y > editor.height) { error('Joint coordinates must be inside the page.', true); return; }
-  selectedPose().joints[Number($('joint-select').value)] = [x, y]; poseDirty = true; draw();
+  selectedPose().joints[Number($('joint-select').value)] = [x, y]; poseDirty = true;
+  selectedPose().joint_scores ??= Array(33).fill(1);
+  selectedPose().joint_scores[Number($('joint-select').value)] = 1;
+  renderPoses(Number($('pose-select').value)); draw();
 });
+$('show-uncertain').addEventListener('change', draw);
 
 function draw() {
   if (!pageImage || !editor) return;
@@ -234,8 +262,9 @@ function draw() {
     if (!pose.joints) return;
     ctx.strokeStyle = index === Number($('pose-select').value) ? '#00b7a4' : '#7961d1';
     ctx.fillStyle = ctx.strokeStyle; ctx.lineWidth = Math.max(2, canvas.width / 300);
-    edges.forEach(([first, second]) => { ctx.beginPath(); ctx.moveTo(...pose.joints[first]); ctx.lineTo(...pose.joints[second]); ctx.stroke(); });
-    pose.joints.forEach(joint => { ctx.beginPath(); ctx.arc(joint[0], joint[1], radius, 0, Math.PI * 2); ctx.fill(); });
+    const visible = joint => $('show-uncertain').checked || (pose.joint_scores?.[joint] ?? 1) >= jointThreshold;
+    edges.forEach(([first, second]) => { if (!visible(first) || !visible(second)) return; ctx.beginPath(); ctx.moveTo(...pose.joints[first]); ctx.lineTo(...pose.joints[second]); ctx.stroke(); });
+    pose.joints.forEach((joint, jointIndex) => { if (!visible(jointIndex)) return; ctx.beginPath(); ctx.arc(joint[0], joint[1], radius, 0, Math.PI * 2); ctx.fill(); });
   });
 }
 for (const key of ['left','top','right','bottom']) $(`crop-${key}`).addEventListener('input', draw);
@@ -257,6 +286,7 @@ $('review-canvas').addEventListener('pointerdown', event => {
   else {
     let nearest = null, distance = editor.width / $('review-canvas').getBoundingClientRect().width * 15;
     editor.poses.forEach((pose, poseIndex) => pose.joints?.forEach((joint, jointIndex) => {
+      if (!$('show-uncertain').checked && (pose.joint_scores?.[jointIndex] ?? 1) < jointThreshold) return;
       const candidate = Math.hypot(joint[0] - point[0], joint[1] - point[1]);
       if (candidate < distance) { distance = candidate; nearest = { poseIndex, jointIndex }; }
     }));
@@ -269,7 +299,11 @@ $('review-canvas').addEventListener('pointermove', event => {
   if (!pointer) return;
   const point = pagePoint(event);
   if (pointer.crop) setBounds([Math.floor(Math.min(pointer.start[0], point[0])), Math.floor(Math.min(pointer.start[1], point[1])), Math.ceil(Math.max(pointer.start[0], point[0])), Math.ceil(Math.max(pointer.start[1], point[1]))]);
-  else { editor.poses[pointer.poseIndex].joints[pointer.jointIndex] = point; poseDirty = true; syncJointFields(); }
+  else {
+    const pose = editor.poses[pointer.poseIndex];
+    pose.joints[pointer.jointIndex] = point; pose.joint_scores ??= Array(33).fill(1);
+    pose.joint_scores[pointer.jointIndex] = 1; poseDirty = true; syncJointFields();
+  }
   draw();
 });
 function endPointer() {
@@ -283,7 +317,7 @@ $('add-pose').addEventListener('click', () => {
   if (editor.poses.some(pose => !pose.joints)) { error('Re-detect or remove migrated skeletons before adding a new one.', true); return; }
   const template = [[.5,.12],[.48,.10],[.46,.10],[.44,.11],[.52,.10],[.54,.10],[.56,.11],[.42,.13],[.58,.13],[.47,.17],[.53,.17],[.35,.28],[.65,.28],[.25,.43],[.75,.43],[.2,.58],[.8,.58],[.18,.6],[.82,.6],[.19,.62],[.81,.62],[.21,.61],[.79,.61],[.42,.55],[.58,.55],[.4,.73],[.6,.73],[.38,.91],[.62,.91],[.37,.94],[.63,.94],[.33,.95],[.67,.95]];
   const [left, top, right, bottom] = cropBounds();
-  editor.poses.push({ joints: template.map(([x,y]) => [left + x * (right-left), top + y * (bottom-top)]) });
+  editor.poses.push({ joints: template.map(([x,y]) => [left + x * (right-left), top + y * (bottom-top)]), joint_scores: Array(33).fill(1), backend: 'manual' });
   poseDirty = true;
   if (Number($('participant-count').value) < editor.poses.length) {
     $('participant-count').value = editor.poses.length;
@@ -316,6 +350,7 @@ async function savePanel(status) {
   if (poseDirty) {
     if (editor.poses.some(pose => !pose.joints)) throw new Error('Re-detect or remove the remaining migrated skeletons before saving edited poses.');
     body.poses = editor.poses.map(pose => pose.joints);
+    body.pose_scores = editor.poses.map(pose => pose.joint_scores || Array(33).fill(1));
   }
   ['accept-panel','save-panel','skip-panel'].forEach(id => $(id).disabled = true);
   try {

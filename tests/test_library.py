@@ -33,7 +33,8 @@ def joints():
 
 def fake_details(image, manga=False):
     coords = np.asarray(joints(), np.float32) / [240, 320]
-    return [{"vector": normalize_pose(coords.copy()), "bounds": [.1, .1, .8, .9], "joints": coords.tolist()}]
+    return [{"vector": normalize_pose(coords.copy()), "bounds": [.1, .1, .8, .9], "joints": coords.tolist(),
+             "joint_scores": [1.] * 33, "backend": "rtmpose-humanart"}]
 
 
 class LibraryTests(unittest.TestCase):
@@ -126,7 +127,7 @@ class LibraryTests(unittest.TestCase):
         ], "accepted")
         self.catalog.update_panel(ids[0], {"genders": ["female", "unknown"]})
         before = set(self.root.rglob("*"))
-        with patch("app.main.extract_pose_detections", return_value=[(vector, (0,0,1,1))]):
+        with patch("app.main.extract_pose_details", return_value=[{"vector": vector, "bounds": (0,0,1,1), "joint_scores": [1.] * 33}]):
             response = self.client.post("/api/search", files={"image": ("personal-photo.png", image_bytes(), "image/png")})
             self.assertEqual(response.status_code, 200, response.text)
             result = response.json()

@@ -2,6 +2,8 @@
 
 Start the app, then run:
 
+Install the drawing models once beforehand with `python scripts/setup_pose_models.py`. The setup downloads model weights, not reference images. Subsequent imports and searches run locally.
+
 ```powershell
 python scripts/batch_upload.py "C:\path\to\volume.pdf" --name "My references"
 python scripts/batch_upload.py "C:\path\to\page-folder" --dataset-id EXISTING_ID

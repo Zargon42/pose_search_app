@@ -9,6 +9,8 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
+from .pose_matching import body_distances
+
 POSE_SCHEMA_VERSION = 1
 GENDERS = {"unknown", "male", "female", "nonbinary", "other"}
 
@@ -71,6 +73,13 @@ class Catalog:
                 CREATE INDEX IF NOT EXISTS panels_page_status ON panels(page_id, status);
                 CREATE INDEX IF NOT EXISTS poses_panel ON poses(panel_id);
             """)
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(poses)")}
+            if "joint_scores" not in columns:
+                db.execute("ALTER TABLE poses ADD COLUMN joint_scores TEXT")
+            if "backend" not in columns:
+                db.execute("ALTER TABLE poses ADD COLUMN backend TEXT NOT NULL DEFAULT 'legacy'")
+            if "kind" not in {row["name"] for row in db.execute("PRAGMA table_info(jobs)")}:
+                db.execute("ALTER TABLE jobs ADD COLUMN kind TEXT NOT NULL DEFAULT 'import'")
             db.execute("UPDATE jobs SET status='interrupted', error='Import interrupted by app shutdown. Import the remaining files again.' WHERE status IN ('queued', 'running', 'cancelling')")
         self.migrate_legacy()
 
@@ -143,8 +152,12 @@ class Catalog:
             vector = np.asarray(pose["vector"], dtype=np.float32)
             if vector.shape != (66,) or not np.isfinite(vector).all():
                 raise ValueError("Pose vectors must contain 66 finite coordinates.")
-            db.execute("INSERT INTO poses VALUES(?,?,?,?,?,?)", (uid(), panel_id, vector.tobytes(),
-                       json.dumps(pose.get("joints")), json.dumps(pose.get("bounds")), POSE_SCHEMA_VERSION))
+            confidence = np.asarray(pose.get("joint_scores", [1.] * 33), np.float32)
+            if confidence.shape != (33,) or not np.isfinite(confidence).all() or (confidence < 0).any() or (confidence > 1).any():
+                raise ValueError("Pose confidence must contain 33 finite values between zero and one.")
+            db.execute("INSERT INTO poses(id,panel_id,vector,joints,bounds,schema_version,joint_scores,backend) VALUES(?,?,?,?,?,?,?,?)", (uid(), panel_id, vector.tobytes(),
+                       json.dumps(pose.get("joints")), json.dumps(pose.get("bounds")), POSE_SCHEMA_VERSION,
+                       json.dumps(confidence.tolist()), pose.get("backend", "manual")))
 
     def add_panel(self, page_id, candidate):
         panel_id = uid()
@@ -190,6 +203,8 @@ class Catalog:
                 raise KeyError("Panel not found.")
             panel = self._panel(row)
             panel["poses"] = [{"id": pose["id"], "joints": json.loads(pose["joints"]), "bounds": json.loads(pose["bounds"]),
+                               "joint_scores": json.loads(pose["joint_scores"]) if pose["joint_scores"] else [1.] * 33,
+                               "backend": pose["backend"],
                                "vector": np.frombuffer(pose["vector"], dtype=np.float32).tolist()}
                               for pose in db.execute("SELECT * FROM poses WHERE panel_id=? ORDER BY rowid", (panel_id,))]
             return panel
@@ -211,7 +226,7 @@ class Catalog:
                 db.execute("DELETE FROM poses WHERE panel_id=?", (panel_id,))
                 self._insert_poses(db, panel_id, poses)
 
-    def search(self, vectors, dataset_id=None, participant_count=None, gender=None, limit=12):
+    def search(self, vectors, dataset_id=None, participant_count=None, gender=None, limit=12, *, query_scores=None, query_dimensions=None):
         # Rank figures, then keep only the closest figure from each panel.
         clauses = ["p.status='accepted'", "ps.schema_version=?"]
         args = [POSE_SCHEMA_VERSION]
@@ -224,14 +239,21 @@ class Catalog:
             args.append(gender)
         best = {}
         with self.connect() as db:
-            cursor = db.execute("SELECT ps.* FROM poses ps JOIN panels p ON p.id=ps.panel_id JOIN pages pg ON pg.id=p.page_id WHERE " + " AND ".join(clauses), args)
+            cursor = db.execute("SELECT ps.*, p.bounds AS panel_bounds FROM poses ps JOIN panels p ON p.id=ps.panel_id JOIN pages pg ON pg.id=p.page_id WHERE " + " AND ".join(clauses), args)
             while rows := cursor.fetchmany(4096):
                 matrix = np.stack([np.frombuffer(row["vector"], dtype=np.float32) for row in rows])
-                distances = np.stack([np.linalg.norm(matrix - vector, axis=1) for vector in vectors])
+                scores = np.asarray([json.loads(row["joint_scores"]) if row["joint_scores"] else [1.] * 33 for row in rows], np.float32)
+                bounds = np.asarray([json.loads(row["panel_bounds"]) for row in rows], np.float32)
+                dimensions = bounds[:, 2:] - bounds[:, :2]
+                distances = np.stack([body_distances(matrix, vector, scores,
+                    query_scores[index] if query_scores is not None else np.ones(33), dimensions, query_dimensions)
+                    for index, vector in enumerate(vectors)])
                 query_indices = distances.argmin(axis=0)
                 for index, row in enumerate(rows):
                     query_index = int(query_indices[index])
                     distance = float(distances[query_index, index])
+                    if not np.isfinite(distance):
+                        continue
                     panel_id = row["panel_id"]
                     if panel_id not in best or distance < best[panel_id]["distance"]:
                         best[panel_id] = {"id": panel_id, "distance": distance, "query_pose_index": query_index,
@@ -243,11 +265,52 @@ class Catalog:
             match.update(panel)
         return results
 
-    def create_job(self, dataset_id, count):
+    def create_job(self, dataset_id, count, kind="import"):
         job_id = uid()
         with self.connect() as db:
-            db.execute("INSERT INTO jobs(id,dataset_id,total_files) VALUES(?,?,?)", (job_id, dataset_id, count))
+            db.execute("INSERT INTO jobs(id,dataset_id,total_files,kind) VALUES(?,?,?,?)", (job_id, dataset_id, count, kind))
         return job_id
+
+    def redetection_panels(self, dataset_id):
+        with self.connect() as db:
+            return [row["id"] for row in db.execute("""
+                SELECT p.id FROM panels p JOIN pages pg ON pg.id=p.page_id
+                WHERE pg.dataset_id=? AND p.status='pending' AND p.notes=''
+                AND NOT EXISTS(SELECT 1 FROM json_each(p.genders) WHERE value!='unknown')
+                AND NOT EXISTS(SELECT 1 FROM poses ps WHERE ps.panel_id=p.id AND ps.backend='manual')
+                AND p.participant_count=(SELECT COUNT(*) FROM poses ps WHERE ps.panel_id=p.id)
+                ORDER BY pg.rowid,p.rowid
+            """, (dataset_id,))]
+
+    def replace_unreviewed(self, original, candidate):
+        """Check again after inference so concurrent review work is preserved."""
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            panel = db.execute("SELECT * FROM panels WHERE id=?", (original["id"],)).fetchone()
+            poses = list(db.execute("SELECT id,backend FROM poses WHERE panel_id=? ORDER BY rowid", (original["id"],)))
+            if (panel is None or panel["status"] != 'pending' or panel["notes"]
+                or any(gender != 'unknown' for gender in json.loads(panel["genders"]))
+                or panel["participant_count"] != len(poses) or any(pose["backend"] == 'manual' for pose in poses)
+                or [pose["id"] for pose in poses] != [pose["id"] for pose in original["poses"]]
+                or json.loads(panel["bounds"]) != original["bounds"]):
+                return False
+            count = len(candidate["poses"])
+            db.execute("UPDATE panels SET participant_count=?,genders=? WHERE id=?", (count, json.dumps(['unknown'] * count), original["id"]))
+            db.execute("DELETE FROM poses WHERE panel_id=?", (original["id"],))
+            self._insert_poses(db, original["id"], candidate["poses"])
+        return True
+
+    def backup_before_redetect(self, job_id):
+        folder = self.root / "backups"
+        folder.mkdir(exist_ok=True)
+        destination = folder / f"before-redetect-{job_id}.sqlite3"
+        target = sqlite3.connect(destination)
+        try:
+            with self.connect() as db:
+                db.backup(target)
+        finally:
+            target.close()
+        return destination
 
     def jobs(self, dataset_id=None):
         with self.connect() as db:
@@ -313,7 +376,7 @@ class Catalog:
                 panel_groups = {}
                 for vector, record in entries:
                     bounds = record.get("panel_bounds") or [0, 0, width, height]
-                    panel_groups.setdefault(tuple(bounds), []).append({"vector": vector, "bounds": record.get("pose_bounds"), "joints": None})
+                    panel_groups.setdefault(tuple(bounds), []).append({"vector": vector, "bounds": record.get("pose_bounds"), "joints": None, "backend": "legacy"})
                 for bounds, poses in panel_groups.items():
                     panel_id = uid()
                     db.execute("INSERT INTO panels(id,page_id,bounds,participant_count,genders,status) VALUES(?,?,?,?,?,'accepted')",

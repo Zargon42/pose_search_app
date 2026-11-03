@@ -20,7 +20,7 @@ from starlette.datastructures import UploadFile as FormUploadFile
 from .catalog import Catalog, GENDERS, uid
 from .importing import ImportManager, SUPPORTED_EXTENSIONS, natural_key, open_image, panel_candidates
 from .page_segmentation import MAX_PANELS, segment_panels
-from .pose_detector import _manga_pose_detector, _pose_detector, extract_pose_detections
+from .pose_detector import _manga_pose_detector, _pose_detector, extract_pose_detections, extract_pose_details
 from .pose_detector import normalize_pose as _normalize_pose
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
@@ -44,6 +44,7 @@ class PanelInput(BaseModel):
     status: Literal["pending", "accepted", "skipped"] | None = None
     notes: str | None = Field(default=None, max_length=10_000)
     poses: list[list[list[float]]] | None = Field(default=None, max_length=64)
+    pose_scores: list[list[float]] | None = Field(default=None, max_length=64)
 
 
 class BoundsInput(BaseModel):
@@ -90,17 +91,23 @@ def validate_bounds(bounds, width, height):
     return bounds
 
 
-def corrected_poses(joint_lists, bounds, width, height):
+def corrected_poses(joint_lists, bounds, width, height, score_lists=None):
     left, top, right, bottom = bounds
     poses = []
-    for joints in joint_lists:
+    if score_lists is not None and len(score_lists) != len(joint_lists):
+        raise HTTPException(422, "Supply confidence values for each skeleton.")
+    for index, joints in enumerate(joint_lists):
         coords = np.asarray(joints, dtype=np.float32)
         if coords.shape != (33, 2) or not np.isfinite(coords).all():
             raise HTTPException(422, "Each skeleton must contain 33 finite x/y landmark pairs.")
         if (coords < 0).any() or (coords[:, 0] > width).any() or (coords[:, 1] > height).any():
             raise HTTPException(422, "Skeleton joints must lie inside the source page.")
         normalized = (coords - [left, top]) / [right - left, bottom - top]
+        confidence = np.asarray(score_lists[index] if score_lists is not None else [1.] * 33, np.float32)
+        if confidence.shape != (33,) or not np.isfinite(confidence).all() or (confidence < 0).any() or (confidence > 1).any():
+            raise HTTPException(422, "Each skeleton needs 33 confidence values between zero and one.")
         poses.append({"joints": coords.tolist(), "vector": normalize_pose(normalized),
+                      "joint_scores": confidence.tolist(), "backend": "manual",
                       "bounds": [float(coords[:, 0].min()), float(coords[:, 1].min()), float(coords[:, 0].max()), float(coords[:, 1].max())]})
     return poses
 
@@ -144,6 +151,10 @@ def create_app(data_dir=None, warm_up=True):
     @application.exception_handler(ValueError)
     async def invalid(_, exc):
         return JSONResponse({"detail": str(exc)}, status_code=422)
+
+    @application.exception_handler(RuntimeError)
+    async def model_unavailable(_, exc):
+        return JSONResponse({"detail": str(exc)}, status_code=503)
 
     application.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
     templates = Jinja2Templates(directory=BASE_DIR / "templates")
@@ -231,6 +242,29 @@ def create_app(data_dir=None, warm_up=True):
     def imports(dataset_id: str | None = None):
         return {"jobs": catalog.jobs(dataset_id)}
 
+    @application.post("/api/datasets/{dataset_id}/redetect", status_code=202)
+    def redetect_dataset(dataset_id: str, request: Request):
+        catalog.dataset(dataset_id)
+        if any(job["status"] in {"queued", "running", "cancelling"} for job in catalog.jobs(dataset_id)):
+            raise HTTPException(409, "Wait for this collection's active job or cancel it first.")
+        # Fail before creating a job if model installation is incomplete.
+        with _manga_pose_detector._lock:
+            _manga_pose_detector._load()
+        panel_ids = catalog.redetection_panels(dataset_id)
+        if not panel_ids:
+            raise HTTPException(422, "No unreviewed automatic panels need re-detection.")
+        job_id = catalog.create_job(dataset_id, len(panel_ids), kind="redetect")
+        try:
+            catalog.backup_before_redetect(job_id)
+            with catalog.connect() as db:
+                pages = db.execute("SELECT COUNT(DISTINCT pg.id) FROM pages pg JOIN panels p ON p.page_id=pg.id WHERE pg.dataset_id=? AND p.status='pending'", (dataset_id,)).fetchone()[0]
+            catalog.update_job(job_id, total_pages=pages)
+            request.app.state.imports.start_redetection(job_id, panel_ids)
+        except Exception as exc:
+            catalog.update_job(job_id, status="failed", error=str(exc))
+            raise
+        return catalog.job(job_id)
+
     @application.get("/api/imports/{job_id}")
     def import_status(job_id: str):
         return catalog.job(job_id)
@@ -255,15 +289,18 @@ def create_app(data_dir=None, warm_up=True):
     @application.patch("/api/panels/{panel_id}")
     def edit_panel(panel_id: str, body: PanelInput):
         original = catalog.panel(panel_id)
-        values = body.model_dump(exclude_none=True, exclude={"poses"})
+        values = body.model_dump(exclude_none=True, exclude={"poses", "pose_scores"})
         bounds = validate_bounds(values.get("bounds", original["bounds"]), original["width"], original["height"])
         poses = None
         if body.poses is not None:
-            poses = corrected_poses(body.poses, bounds, original["width"], original["height"])
+            poses = corrected_poses(body.poses, bounds, original["width"], original["height"], body.pose_scores)
+        elif body.pose_scores is not None:
+            raise HTTPException(422, "Confidence changes require skeleton coordinates.")
         elif bounds != original["bounds"]:
             if any(pose["joints"] is None for pose in original["poses"]):
                 raise HTTPException(422, "Re-detect this migrated panel before changing its crop.")
-            poses = corrected_poses([pose["joints"] for pose in original["poses"]], bounds, original["width"], original["height"])
+            poses = corrected_poses([pose["joints"] for pose in original["poses"]], bounds, original["width"], original["height"],
+                                    [pose["joint_scores"] for pose in original["poses"]])
         count = values.get("participant_count", original["participant_count"])
         pose_count = len(poses if poses is not None else original["poses"])
         if count < pose_count:
@@ -323,14 +360,16 @@ def create_app(data_dir=None, warm_up=True):
         if gender is not None and gender not in GENDERS:
             raise HTTPException(422, "Unknown gender tag.")
         with read_upload(image) as query:
-            detections = extract_pose_detections(query)
+            detections = extract_pose_details(query)
             if not detections:
                 raise HTTPException(400, "No pose detected. Try a photo showing more of the person's body.")
-            matches = catalog.search([vector for vector, _ in detections], dataset_id, participant_count, gender, limit)
+            matches = catalog.search([pose["vector"] for pose in detections], dataset_id, participant_count, gender, limit,
+                                      query_scores=[pose.get("joint_scores", [1.] * 33) for pose in detections],
+                                      query_dimensions=(query.width, query.height))
             for match in matches:
                 match["match"] = match["image_url"]
                 match["match_panel_bounds"] = match["bounds"]
-                match["query_pose_bounds"] = _pixel_bounds(detections[match["query_pose_index"]][1], query.width, query.height)
+                match["query_pose_bounds"] = _pixel_bounds(detections[match["query_pose_index"]]["bounds"], query.width, query.height)
             result = {"matches": matches, "query_pose_count": len(detections)}
             if matches:
                 result.update({key: matches[0][key] for key in ("match", "distance", "query_pose_index", "query_pose_bounds", "match_panel_bounds", "match_pose_bounds")})
@@ -379,7 +418,8 @@ def create_app(data_dir=None, warm_up=True):
                 raise HTTPException(400, "No poses detected in the segmented page.")
             matches = []
             for vector, record in zip(vectors, records):
-                for match in catalog.search([vector], limit=1):
+                box = record["panel_bounds"]
+                for match in catalog.search([vector], limit=1, query_dimensions=(box[2]-box[0], box[3]-box[1])):
                     matches.append({**match, "match": match["image_url"], "query_panel_index": record["panel_index"],
                                     "query_panel_bounds": record["panel_bounds"], "query_pose_bounds": record["pose_bounds"]})
             return {"matches": sorted(matches, key=lambda match: match["distance"])[:30], "panel_count": len(bounds), "pose_count": len(vectors)}
