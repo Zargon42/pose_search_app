@@ -2,3 +2,9 @@ app/data
 app/__pycache__
 venv
 bizarre-pose-estimator/
+.tools/
+__pycache__/
+*.pyc
+.pytest_cache/
+data/
+

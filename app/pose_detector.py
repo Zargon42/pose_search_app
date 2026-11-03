@@ -67,7 +67,7 @@ class PoseDetector:
     def warm_up(self) -> None:
         self.detect(Image.new("RGB", (256, 256), "white"))
 
-    def detect(self, image: Image.Image) -> list[tuple[np.ndarray, tuple[float, float, float, float]]]:
+    def detect_details(self, image: Image.Image) -> list[dict]:
         rgb = image.convert("RGB")
         if max(rgb.size) > MAX_IMAGE_SIDE:
             scale = MAX_IMAGE_SIDE / max(rgb.size)
@@ -89,17 +89,20 @@ class PoseDetector:
                 float(np.clip(coords[:, 1].max(), 0, 1)),
             )
             visibility = float(np.mean([landmark.visibility for landmark in landmarks]))
-            candidates.append((visibility, normalize_pose(coords), bounds))
+            candidates.append((visibility, normalize_pose(coords.copy()), bounds, coords))
 
         candidates.sort(key=lambda candidate: candidate[0], reverse=True)
         detections = []
         kept_bounds = []
-        for _, vector, bounds in candidates:
+        for _, vector, bounds, coords in candidates:
             if any(_box_iou(bounds, kept) > 0.55 for kept in kept_bounds):
                 continue
-            detections.append((vector, bounds))
+            detections.append({"vector": vector, "bounds": bounds, "joints": coords.tolist()})
             kept_bounds.append(bounds)
         return detections
+
+    def detect(self, image: Image.Image) -> list[tuple[np.ndarray, tuple[float, float, float, float]]]:
+        return [(pose["vector"], pose["bounds"]) for pose in self.detect_details(image)]
 
     def close(self) -> None:
         with self._lock:
@@ -118,6 +121,11 @@ def extract_pose_detections(
 ) -> list[tuple[np.ndarray, tuple[float, float, float, float]]]:
     detector = _manga_pose_detector if manga else _pose_detector
     return detector.detect(image)
+
+
+def extract_pose_details(image: Image.Image, manga: bool = False) -> list[dict]:
+    detector = _manga_pose_detector if manga else _pose_detector
+    return detector.detect_details(image)
 
 
 def extract_pose_vectors(image: Image.Image) -> list[np.ndarray]:

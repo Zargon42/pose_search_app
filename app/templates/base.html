@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Pose Library{% endblock %}</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="navbar"><nav class="nav-container" aria-label="Main navigation">
+    <a class="nav-title" href="/"><span class="brand-mark" aria-hidden="true">P</span> Pose Library</a>
+    <div class="nav-links">
+      <a class="nav-link {% if request.url.path == '/' %}active{% endif %}" href="/">Find a pose</a>
+      <a class="nav-link {% if request.url.path in ['/library', '/upload'] %}active{% endif %}" href="/library">My library</a>
+      <a class="nav-link {% if request.url.path == '/full-page' %}active{% endif %}" href="/full-page">Page tools</a>
+    </div>
+    <span class="local-badge">On your computer</span>
+  </nav></header>
+  <main class="container container-wide">{% block content %}{% endblock %}</main>
+  <footer>Your images and library stay on this computer.</footer>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

@@ -1,382 +1,398 @@
-import json
+import io
 import logging
-import uuid
+import os
+import shutil
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Literal
+from urllib.parse import urlsplit
 
 import numpy as np
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from PIL import Image, ImageOps, UnidentifiedImageError
+from PIL import Image, UnidentifiedImageError
+from pydantic import BaseModel, Field
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+from starlette.datastructures import UploadFile as FormUploadFile
 
+from .catalog import Catalog, GENDERS, uid
+from .importing import ImportManager, SUPPORTED_EXTENSIONS, natural_key, open_image, panel_candidates
 from .page_segmentation import MAX_PANELS, segment_panels
 from .pose_detector import _manga_pose_detector, _pose_detector, extract_pose_detections
 from .pose_detector import normalize_pose as _normalize_pose
 
-
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
-logger = logging.getLogger(__name__)
-
 BASE_DIR = Path(__file__).resolve().parent
-INDEX_PATH = BASE_DIR / "data" / "pose_index.npz"
-DB_PATH = BASE_DIR / "data" / "db_files.json"
-POSE_RECORDS_PATH = BASE_DIR / "data" / "pose_records.json"
-IMAGES_DIR = BASE_DIR / "data" / "images"
-POSE_SCHEMA_VERSION = 1
-
-pose_index: np.ndarray | None = None
-file_paths: list[str] = []
-pose_records: list[dict[str, Any]] = []
-index_schema_version = POSE_SCHEMA_VERSION
+MAX_UPLOAD_BYTES = 1024 * 1024 * 1024
+MAX_BATCH_BYTES = 4 * MAX_UPLOAD_BYTES
 
 
-def load_index() -> None:
-    global pose_index, file_paths, pose_records, index_schema_version
-    if not INDEX_PATH.exists() or not DB_PATH.exists():
-        pose_index = None
-        file_paths = []
-        pose_records = []
-        index_schema_version = POSE_SCHEMA_VERSION
-        return
-
-    with np.load(INDEX_PATH) as data:
-        pose_index = data["vectors"].astype(np.float32, copy=False)
-        index_schema_version = (
-            int(data["schema_version"]) if "schema_version" in data else POSE_SCHEMA_VERSION
-        )
-    with DB_PATH.open("r", encoding="utf-8") as file:
-        file_paths = json.load(file)
-
-    if POSE_RECORDS_PATH.exists():
-        with POSE_RECORDS_PATH.open("r", encoding="utf-8") as file:
-            pose_records = json.load(file)
-    else:
-        pose_records = [
-            {"panel_bounds": None, "pose_bounds": None, "schema_version": POSE_SCHEMA_VERSION}
-            for _ in file_paths
-        ]
-
-    if len(file_paths) != len(pose_index) or len(pose_records) != len(file_paths):
-        raise ValueError("Pose index, image paths, and pose metadata have different lengths.")
+class DatasetInput(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    source_url: str = Field(default="", max_length=2000)
+    license: str = Field(default="", max_length=2000)
+    attribution: str = Field(default="", max_length=2000)
+    notes: str = Field(default="", max_length=10_000)
 
 
-load_index()
+class PanelInput(BaseModel):
+    bounds: list[int] | None = Field(default=None, min_length=4, max_length=4)
+    participant_count: int | None = Field(default=None, ge=0, le=64)
+    genders: list[str] | None = Field(default=None, max_length=64)
+    status: Literal["pending", "accepted", "skipped"] | None = None
+    notes: str | None = Field(default=None, max_length=10_000)
+    poses: list[list[list[float]]] | None = Field(default=None, max_length=64)
 
 
-def extract_pose_vector(image: Image.Image) -> np.ndarray | None:
-    """Compatibility wrapper returning the first detected pose as a vector."""
+class BoundsInput(BaseModel):
+    bounds: list[int] = Field(min_length=4, max_length=4)
+
+
+async def import_uploads(request: Request):
+    async with request.form(max_files=20_000) as form:
+        files = form.getlist("files")
+        if any(not isinstance(file, FormUploadFile) for file in files):
+            raise HTTPException(422, "The files field must contain uploaded files.")
+        yield files
+
+
+def normalize_pose(coords):
+    return _normalize_pose(coords)
+
+
+def extract_pose_vector(image):
     detections = extract_pose_detections(image)
     return detections[0][0] if detections else None
 
 
-def normalize_pose(coords: np.ndarray) -> np.ndarray:
-    return _normalize_pose(coords)
+def _pixel_bounds(bounds, width, height):
+    return [round(bounds[0] * width), round(bounds[1] * height), round(bounds[2] * width), round(bounds[3] * height)]
 
 
-def _read_image(upload: UploadFile) -> Image.Image:
-    try:
-        with Image.open(upload.file) as source:
-            return ImageOps.exif_transpose(source).convert("RGB")
-    except (UnidentifiedImageError, OSError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid image file: {exc}") from exc
-
-
-def _pixel_bounds(
-    bounds: tuple[float, float, float, float],
-    width: int,
-    height: int,
-) -> list[int]:
-    left, top, right, bottom = bounds
-    return [
-        round(left * width),
-        round(top * height),
-        round(right * width),
-        round(bottom * height),
-    ]
-
-
-def _save_image(image: Image.Image, prefix: str = "") -> str:
-    IMAGES_DIR.mkdir(parents=True, exist_ok=True)
-    filename = f"{prefix}{uuid.uuid4()}.png"
-    image.save(IMAGES_DIR / filename, format="PNG")
-    return f"/images/{filename}"
-
-
-def _validate_vectors(vectors: list[np.ndarray]) -> np.ndarray:
-    vector_array = np.asarray(vectors, dtype=np.float32)
-    if vector_array.ndim != 2 or not len(vector_array):
-        raise ValueError("At least one valid pose vector is required.")
-    if pose_index is not None:
-        _ensure_index()
-    if pose_index is not None and vector_array.shape[1] != pose_index.shape[1]:
-        raise HTTPException(status_code=409, detail="Pose vector size mismatch; rebuild the index with one model.")
-    return vector_array
-
-
-def _save_index(
-    vector_array: np.ndarray,
-    image_url: str,
-    records: list[dict[str, Any]],
-) -> None:
-    global pose_index, file_paths, pose_records
-    updated_index = vector_array if pose_index is None else np.vstack((pose_index, vector_array))
-    updated_paths = file_paths + [image_url] * len(vector_array)
-    updated_records = pose_records + records
-
-    INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(INDEX_PATH, vectors=updated_index, schema_version=POSE_SCHEMA_VERSION)
-    with DB_PATH.open("w", encoding="utf-8") as file:
-        json.dump(updated_paths, file)
-    with POSE_RECORDS_PATH.open("w", encoding="utf-8") as file:
-        json.dump(updated_records, file)
-    load_index()
-
-
-def _pose_record(
-    panel_bounds: list[int] | None = None,
-    pose_bounds: list[int] | None = None,
-) -> dict[str, Any]:
-    return {
-        "panel_bounds": panel_bounds,
-        "pose_bounds": pose_bounds,
-        "schema_version": POSE_SCHEMA_VERSION,
-    }
-
-
-def _page_detections(
-    image: Image.Image,
-) -> tuple[list[np.ndarray], list[dict[str, Any]], list[tuple[int, int, int, int]]]:
-    panels = segment_panels(image)
-    vectors: list[np.ndarray] = []
-    records: list[dict[str, Any]] = []
-    for panel_index, bounds in enumerate(panels):
+def _page_detections(image):
+    """Compatibility helper for callers of the original page pipeline."""
+    panels, vectors, records = segment_panels(image), [], []
+    for index, bounds in enumerate(panels):
         left, top, right, bottom = bounds
-        crop = image.crop(bounds)
-        for vector, local_bounds in extract_pose_detections(crop, manga=True):
-            x0, y0, x1, y1 = local_bounds
-            pose_bounds = [
-                left + round(x0 * (right - left)),
-                top + round(y0 * (bottom - top)),
-                left + round(x1 * (right - left)),
-                top + round(y1 * (bottom - top)),
-            ]
+        for vector, local_bounds in extract_pose_detections(image.crop(bounds), manga=True):
+            x0, y0, x1, y1 = _pixel_bounds(local_bounds, right - left, bottom - top)
             vectors.append(vector)
-            records.append(
-                {
-                    **_pose_record(list(bounds), pose_bounds),
-                    "panel_index": panel_index,
-                }
-            )
+            records.append({"panel_bounds": list(bounds), "pose_bounds": [left + x0, top + y0, left + x1, top + y1], "panel_index": index, "schema_version": 1})
     return vectors, records, panels
 
 
-def _match_pose(vector: np.ndarray) -> tuple[int, float]:
-    _ensure_index()
-    assert pose_index is not None
-    if vector.shape[0] != pose_index.shape[1]:
-        raise HTTPException(status_code=409, detail="Pose vector size mismatch; rebuild the index with one model.")
-    distances = np.linalg.norm(pose_index - vector, axis=1)
-    index = int(np.argmin(distances))
-    return index, float(distances[index])
+def validate_bounds(bounds, width, height):
+    left, top, right, bottom = bounds
+    if not (0 <= left < right <= width and 0 <= top < bottom <= height):
+        raise HTTPException(422, "Panel bounds must describe a positive rectangle inside the source page.")
+    return bounds
 
 
-def _ensure_index() -> None:
-    if pose_index is None or not len(file_paths):
-        raise HTTPException(status_code=400, detail="Index is empty. Upload pose images first.")
-    if index_schema_version != POSE_SCHEMA_VERSION:
-        raise HTTPException(status_code=409, detail="Pose index schema is incompatible; rebuild the index.")
+def corrected_poses(joint_lists, bounds, width, height):
+    left, top, right, bottom = bounds
+    poses = []
+    for joints in joint_lists:
+        coords = np.asarray(joints, dtype=np.float32)
+        if coords.shape != (33, 2) or not np.isfinite(coords).all():
+            raise HTTPException(422, "Each skeleton must contain 33 finite x/y landmark pairs.")
+        if (coords < 0).any() or (coords[:, 0] > width).any() or (coords[:, 1] > height).any():
+            raise HTTPException(422, "Skeleton joints must lie inside the source page.")
+        normalized = (coords - [left, top]) / [right - left, bottom - top]
+        poses.append({"joints": coords.tolist(), "vector": normalize_pose(normalized),
+                      "bounds": [float(coords[:, 0].min()), float(coords[:, 1].min()), float(coords[:, 0].max()), float(coords[:, 1].max())]})
+    return poses
 
 
-@asynccontextmanager
-async def lifespan(_: FastAPI):
-    logger.info("Warming up MediaPipe pose detector")
-    _pose_detector.warm_up()
-    yield
-    _pose_detector.close()
-    _manga_pose_detector.close()
+def create_app(data_dir=None, warm_up=True):
+    catalog = Catalog(Path(data_dir or os.environ.get("POSE_DATA_DIR", BASE_DIR / "data")))
 
+    @asynccontextmanager
+    async def lifespan(application):
+        catalog.initialize()
+        manager = ImportManager(catalog)
+        application.state.imports = manager
+        try:
+            if warm_up:
+                _pose_detector.warm_up()
+            yield
+        finally:
+            manager.close()
+            if warm_up:
+                _pose_detector.close()
+                _manga_pose_detector.close()
 
-app = FastAPI(title="Pose Search App", lifespan=lifespan)
-app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
-IMAGES_DIR.mkdir(parents=True, exist_ok=True)
-app.mount("/images", StaticFiles(directory=IMAGES_DIR), name="images")
-templates = Jinja2Templates(directory=BASE_DIR / "templates")
+    application = FastAPI(title="Pose Library", lifespan=lifespan)
+    application.state.catalog = catalog
+    application.add_middleware(TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1", "[::1]", "testserver"])
 
+    @application.middleware("http")
+    async def local_requests(request, call_next):
+        origin = request.headers.get("origin")
+        if request.method not in {"GET", "HEAD", "OPTIONS"} and origin and urlsplit(origin).netloc != request.url.netloc:
+            return JSONResponse({"detail": "Cross-origin writes to this local library are disabled."}, status_code=403)
+        response = await call_next(request)
+        if request.url.path.startswith("/api/"):
+            response.headers["Cache-Control"] = "no-store"
+        return response
 
-@app.get("/")
-def home(request: Request):
-    return templates.TemplateResponse(request=request, name="index.html")
+    @application.exception_handler(KeyError)
+    async def missing(_, exc):
+        return JSONResponse({"detail": str(exc.args[0])}, status_code=404)
 
+    @application.exception_handler(ValueError)
+    async def invalid(_, exc):
+        return JSONResponse({"detail": str(exc)}, status_code=422)
 
-@app.get("/upload")
-def upload_page(request: Request):
-    return templates.TemplateResponse(request=request, name="upload.html")
+    application.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
+    templates = Jinja2Templates(directory=BASE_DIR / "templates")
 
+    @application.get("/")
+    def home(request: Request):
+        return templates.TemplateResponse(request=request, name="index.html")
 
-@app.get("/full-page")
-def full_page(request: Request):
-    return templates.TemplateResponse(request=request, name="full_page.html")
+    @application.get("/upload")
+    @application.get("/library")
+    def library(request: Request):
+        return templates.TemplateResponse(request=request, name="upload.html")
 
+    @application.get("/full-page")
+    def full_page(request: Request):
+        return templates.TemplateResponse(request=request, name="full_page.html")
 
-@app.post("/api/search")
-def search(image: UploadFile = File(...)):
-    _ensure_index()
-    image_data = _read_image(image)
-    detections = extract_pose_detections(image_data)
-    if not detections:
-        raise HTTPException(status_code=400, detail="No pose detected in the image.")
+    @application.get("/api/datasets")
+    def datasets():
+        return {"datasets": catalog.datasets()}
 
-    match_index = -1
-    distance = float("inf")
-    query_index = 0
-    query_bounds = detections[0][1]
-    for index, (vector, bounds) in enumerate(detections):
-        candidate_index, candidate_distance = _match_pose(vector)
-        if candidate_distance < distance:
-            match_index = candidate_index
-            distance = candidate_distance
-            query_index = index
-            query_bounds = bounds
-    uploaded_url = _save_image(image_data, prefix="search_")
-    return JSONResponse(
-        {
-            "uploaded_image": uploaded_url,
-            "match": file_paths[match_index],
-            "distance": distance,
-            "query_pose_count": len(detections),
-            "query_pose_index": query_index,
-            "query_pose_bounds": _pixel_bounds(query_bounds, image_data.width, image_data.height),
-            "match_panel_bounds": pose_records[match_index].get("panel_bounds"),
-            "match_pose_bounds": pose_records[match_index].get("pose_bounds"),
-        }
-    )
+    @application.post("/api/datasets", status_code=201)
+    def create_dataset(body: DatasetInput):
+        values = body.model_dump()
+        values["name"] = values["name"].strip()
+        if not values["name"]:
+            raise HTTPException(422, "Dataset name cannot be blank.")
+        return catalog.dataset(catalog.create_dataset(**values))
 
+    @application.patch("/api/datasets/{dataset_id}")
+    def edit_dataset(dataset_id: str, body: DatasetInput):
+        values = body.model_dump()
+        values["name"] = values["name"].strip()
+        if not values["name"]:
+            raise HTTPException(422, "Dataset name cannot be blank.")
+        catalog.update_dataset(dataset_id, values)
+        return catalog.dataset(dataset_id)
 
-@app.post("/api/upload")
-def upload(image: UploadFile = File(...)):
-    image_data = _read_image(image)
-    detections = extract_pose_detections(image_data)
-    if not detections:
-        raise HTTPException(status_code=400, detail="No pose detected in the image.")
+    @application.delete("/api/datasets/{dataset_id}")
+    def delete_dataset(dataset_id: str):
+        catalog.delete_dataset(dataset_id)
+        return {"message": "Dataset and its rendered pages deleted."}
 
-    vectors = _validate_vectors([vector for vector, _ in detections])
-    image_url = _save_image(image_data)
-    records = [
-        _pose_record(pose_bounds=_pixel_bounds(bounds, image_data.width, image_data.height))
-        for _, bounds in detections
-    ]
-    _save_index(vectors, image_url, records)
-    return JSONResponse(
-        {"message": f"Image indexed with {len(vectors)} pose(s).", "pose_count": len(vectors)}
-    )
-
-
-@app.post("/api/segment-page")
-def segment_page(image: UploadFile = File(...)):
-    image_data = _read_image(image)
-    panels = segment_panels(image_data)
-    return JSONResponse(
-        {
-            "width": image_data.width,
-            "height": image_data.height,
-            "panel_count": len(panels),
-            "max_panels": MAX_PANELS,
-            "panels": [
-                {"panel_index": index, "bounds": list(bounds)}
-                for index, bounds in enumerate(panels)
-            ],
-        }
-    )
-
-
-@app.post("/api/full-page/search")
-def search_full_page(image: UploadFile = File(...)):
-    _ensure_index()
-    image_data = _read_image(image)
-    vectors, query_records, panels = _page_detections(image_data)
-    if not vectors:
-        raise HTTPException(
-            status_code=400,
-            detail=f"No poses detected across {len(panels)} segmented panel(s).",
-        )
-
-    vector_array = _validate_vectors(vectors)
-    uploaded_url = _save_image(image_data, prefix="search_page_")
-    matches = []
-    for vector, record in zip(vector_array, query_records):
-        match_index, distance = _match_pose(vector)
-        matches.append(
-            {
-                "query_panel_index": record["panel_index"],
-                "query_panel_bounds": record["panel_bounds"],
-                "query_pose_bounds": record["pose_bounds"],
-                "match": file_paths[match_index],
-                "distance": distance,
-                "match_panel_bounds": pose_records[match_index].get("panel_bounds"),
-                "match_pose_bounds": pose_records[match_index].get("pose_bounds"),
+    @application.post("/api/datasets/{dataset_id}/imports", status_code=202, openapi_extra={
+        "requestBody": {"required": True, "content": {"multipart/form-data": {"schema": {
+            "type": "object", "required": ["files"], "properties": {
+                "files": {"type": "array", "items": {"type": "string", "format": "binary"}}
             }
-        )
-    matches.sort(key=lambda result: result["distance"])
-    return JSONResponse(
-        {
-            "uploaded_image": uploaded_url,
-            "panel_count": len(panels),
-            "pose_count": len(vectors),
-            "matches": matches[:30],
-        }
-    )
+        }}}}
+    })
+    async def import_files(dataset_id: str, request: Request, files: list[UploadFile] = Depends(import_uploads)):
+        catalog.dataset(dataset_id)
+        if not files or len(files) > 20_000:
+            raise HTTPException(422, "Choose between 1 and 20,000 files.")
+        for file in files:
+            if Path(file.filename or "").suffix.lower() not in SUPPORTED_EXTENSIONS:
+                raise HTTPException(422, f"Unsupported file type: {file.filename}")
+        manager = request.app.state.imports
+        directory = manager.staging / uid()
+        directory.mkdir()
+        staged, batch_size = [], 0
+        try:
+            for file in sorted(files, key=lambda item: natural_key(item.filename or "")):
+                path = directory / uid()
+                size = 0
+                with path.open("wb") as target:
+                    while chunk := await file.read(1024 * 1024):
+                        size += len(chunk)
+                        batch_size += len(chunk)
+                        if size > MAX_UPLOAD_BYTES or batch_size > MAX_BATCH_BYTES:
+                            raise HTTPException(413, "Imports allow 1 GiB per file and 4 GiB per batch.")
+                        target.write(chunk)
+                staged.append((path, file.filename or "Untitled image"))
+            job_id = catalog.create_job(dataset_id, len(files))
+            manager.start(job_id, staged, directory)
+            return catalog.job(job_id)
+        except Exception:
+            shutil.rmtree(directory)
+            raise
+        finally:
+            for file in files:
+                await file.close()
+
+    @application.get("/api/imports")
+    def imports(dataset_id: str | None = None):
+        return {"jobs": catalog.jobs(dataset_id)}
+
+    @application.get("/api/imports/{job_id}")
+    def import_status(job_id: str):
+        return catalog.job(job_id)
+
+    @application.post("/api/imports/{job_id}/cancel")
+    def cancel_import(job_id: str, request: Request):
+        catalog.job(job_id)
+        return request.app.state.imports.cancel(job_id)
+
+    @application.get("/api/panels")
+    def panels(dataset_id: str | None = None, status: Literal["pending", "accepted", "skipped"] | None = "accepted",
+               participant_count: int | None = Query(None, ge=0, le=64), gender: str | None = None,
+               limit: int = Query(40, ge=1, le=100), offset: int = Query(0, ge=0)):
+        if gender is not None and gender not in GENDERS:
+            raise HTTPException(422, "Unknown gender tag.")
+        return catalog.list_panels(dataset_id, status, participant_count, gender, limit, offset)
+
+    @application.get("/api/panels/{panel_id}")
+    def panel(panel_id: str):
+        return catalog.panel(panel_id)
+
+    @application.patch("/api/panels/{panel_id}")
+    def edit_panel(panel_id: str, body: PanelInput):
+        original = catalog.panel(panel_id)
+        values = body.model_dump(exclude_none=True, exclude={"poses"})
+        bounds = validate_bounds(values.get("bounds", original["bounds"]), original["width"], original["height"])
+        poses = None
+        if body.poses is not None:
+            poses = corrected_poses(body.poses, bounds, original["width"], original["height"])
+        elif bounds != original["bounds"]:
+            if any(pose["joints"] is None for pose in original["poses"]):
+                raise HTTPException(422, "Re-detect this migrated panel before changing its crop.")
+            poses = corrected_poses([pose["joints"] for pose in original["poses"]], bounds, original["width"], original["height"])
+        count = values.get("participant_count", original["participant_count"])
+        pose_count = len(poses if poses is not None else original["poses"])
+        if count < pose_count:
+            raise HTTPException(422, "Participant count cannot be smaller than the number of skeletons. Remove false detections first.")
+        genders = values.get("genders", original["genders"][:count] + ["unknown"] * max(0, count - len(original["genders"])))
+        if len(genders) != count or any(gender not in GENDERS for gender in genders):
+            raise HTTPException(422, "Provide one supported gender tag (or unknown) per participant.")
+        if values.get("status", original["status"]) == "accepted" and not pose_count:
+            raise HTTPException(422, "Add or detect at least one skeleton before accepting this panel.")
+        values["genders"] = genders
+        catalog.update_panel(panel_id, values, poses)
+        return catalog.panel(panel_id)
+
+    @application.post("/api/panels/{panel_id}/redetect")
+    def redetect_panel(panel_id: str, body: BoundsInput):
+        original = catalog.panel(panel_id)
+        bounds = validate_bounds(body.bounds, original["width"], original["height"])
+        page = catalog.page(original["page_id"])
+        with Image.open(catalog.assets / page["image_name"]) as image:
+            candidate = panel_candidates(image, [bounds])[0]
+        count = len(candidate["poses"])
+        catalog.update_panel(panel_id, {"bounds": bounds, "participant_count": count, "genders": ["unknown"] * count, "status": "pending"}, candidate["poses"])
+        return catalog.panel(panel_id)
+
+    @application.post("/api/pages/{page_id}/panels", status_code=201)
+    def add_panel(page_id: str, body: BoundsInput):
+        page = catalog.page(page_id)
+        bounds = validate_bounds(body.bounds, page["width"], page["height"])
+        with Image.open(catalog.assets / page["image_name"]) as image:
+            candidate = panel_candidates(image, [bounds])[0]
+        return catalog.panel(catalog.add_panel(page_id, candidate))
+
+    @application.get("/api/pages/{page_id}/image")
+    def page_image(page_id: str):
+        page = catalog.page(page_id)
+        return FileResponse(catalog.assets / page["image_name"], media_type="image/png")
+
+    @application.get("/api/panels/{panel_id}/image")
+    def panel_image(panel_id: str):
+        panel = catalog.panel(panel_id)
+        page = catalog.page(panel["page_id"])
+        with Image.open(catalog.assets / page["image_name"]) as image:
+            output = io.BytesIO()
+            image.crop(panel["bounds"]).save(output, "PNG")
+        return Response(output.getvalue(), media_type="image/png")
+
+    def read_upload(upload):
+        try:
+            return open_image(upload.file)
+        except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError) as exc:
+            raise HTTPException(400, f"Invalid image: {exc}") from exc
+
+    @application.post("/api/search")
+    def search(image: UploadFile = File(...), dataset_id: str | None = Form(None),
+               participant_count: int | None = Form(None, ge=0, le=64), gender: str | None = Form(None),
+               limit: int = Form(12, ge=1, le=50)):
+        if gender is not None and gender not in GENDERS:
+            raise HTTPException(422, "Unknown gender tag.")
+        with read_upload(image) as query:
+            detections = extract_pose_detections(query)
+            if not detections:
+                raise HTTPException(400, "No pose detected. Try a photo showing more of the person's body.")
+            matches = catalog.search([vector for vector, _ in detections], dataset_id, participant_count, gender, limit)
+            for match in matches:
+                match["match"] = match["image_url"]
+                match["match_panel_bounds"] = match["bounds"]
+                match["query_pose_bounds"] = _pixel_bounds(detections[match["query_pose_index"]][1], query.width, query.height)
+            result = {"matches": matches, "query_pose_count": len(detections)}
+            if matches:
+                result.update({key: matches[0][key] for key in ("match", "distance", "query_pose_index", "query_pose_bounds", "match_panel_bounds", "match_pose_bounds")})
+            return result
+
+    def default_dataset():
+        with catalog.connect() as db:
+            db.execute("INSERT OR IGNORE INTO datasets(id,name) VALUES('uploads','Image uploads')")
+        return "uploads"
+
+    @application.post("/api/upload")
+    def upload(image: UploadFile = File(...)):
+        with read_upload(image) as source:
+            candidates = panel_candidates(source, [[0, 0, source.width, source.height]])
+            count = len(candidates[0]["poses"])
+            if not count:
+                raise HTTPException(400, "No pose detected. Use Library import to add skeletons manually.")
+            panel_ids = catalog.add_page(default_dataset(), image.filename or "Image upload", 1, source, candidates, status="accepted")
+        return {"message": f"Image indexed with {count} pose(s).", "pose_count": count, "panel_ids": panel_ids}
+
+    @application.post("/api/segment-page")
+    def segment_page(image: UploadFile = File(...)):
+        with read_upload(image) as source:
+            bounds = segment_panels(source)
+            return {"width": source.width, "height": source.height, "panel_count": len(bounds), "max_panels": MAX_PANELS,
+                    "panels": [{"panel_index": index, "bounds": list(box)} for index, box in enumerate(bounds)]}
+
+    @application.post("/api/full-page/upload")
+    def upload_full_page(image: UploadFile = File(...)):
+        with read_upload(image) as source:
+            candidates = panel_candidates(source)
+            count = sum(len(candidate["poses"]) for candidate in candidates)
+            ids = catalog.add_page(default_dataset(), image.filename or "Page upload", 1, source, candidates)
+            for panel_id, candidate in zip(ids, candidates):
+                if candidate["poses"]:
+                    catalog.update_panel(panel_id, {"status": "accepted"})
+            return {"message": f"Indexed {count} pose(s). Panels without detected poses await review in Library.",
+                    "panel_count": len(candidates), "pose_count": count, "panel_ids": ids,
+                    "panels": [{"panel_index": index, "bounds": candidate["bounds"]} for index, candidate in enumerate(candidates)]}
+
+    @application.post("/api/full-page/search")
+    def search_full_page(image: UploadFile = File(...)):
+        with read_upload(image) as source:
+            vectors, records, bounds = _page_detections(source)
+            if not vectors:
+                raise HTTPException(400, "No poses detected in the segmented page.")
+            matches = []
+            for vector, record in zip(vectors, records):
+                for match in catalog.search([vector], limit=1):
+                    matches.append({**match, "match": match["image_url"], "query_panel_index": record["panel_index"],
+                                    "query_panel_bounds": record["panel_bounds"], "query_pose_bounds": record["pose_bounds"]})
+            return {"matches": sorted(matches, key=lambda match: match["distance"])[:30], "panel_count": len(bounds), "pose_count": len(vectors)}
+
+    @application.post("/api/clear-index")
+    def clear_index():
+        if any(job["status"] in {"queued", "running", "cancelling"} for job in catalog.jobs()):
+            raise HTTPException(409, "Cancel active imports before clearing the library.")
+        for dataset in catalog.datasets():
+            catalog.delete_dataset(dataset["id"])
+        return {"message": "Local library cleared. Legacy backup files, if present, were preserved."}
+
+    return application
 
 
-@app.post("/api/full-page/upload")
-def upload_full_page(image: UploadFile = File(...)):
-    image_data = _read_image(image)
-    vectors, records, panels = _page_detections(image_data)
-    if not vectors:
-        raise HTTPException(
-            status_code=400,
-            detail=f"No poses detected across {len(panels)} segmented panel(s).",
-        )
-
-    vector_array = _validate_vectors(vectors)
-    image_url = _save_image(image_data)
-    _save_index(vector_array, image_url, records)
-    return JSONResponse(
-        {
-            "message": f"Indexed {len(vectors)} pose(s) from {len(panels)} panel(s).",
-            "panel_count": len(panels),
-            "pose_count": len(vectors),
-            "image": image_url,
-            "panels": [
-                {"panel_index": index, "bounds": list(bounds)}
-                for index, bounds in enumerate(panels)
-            ],
-        }
-    )
-
-
-@app.post("/api/clear-index")
-def clear_index():
-    global pose_index, file_paths, pose_records, index_schema_version
-    image_names = {
-        Path(image_url).name
-        for image_url in file_paths
-        if image_url.startswith("/images/") and not Path(image_url).name.startswith("search_")
-    }
-    for image_name in image_names:
-        image_path = (IMAGES_DIR / image_name).resolve()
-        if image_path.parent != IMAGES_DIR.resolve():
-            raise HTTPException(status_code=400, detail="Invalid image path in pose index.")
-        if image_path.exists():
-            image_path.unlink()
-
-    for path in (INDEX_PATH, DB_PATH, POSE_RECORDS_PATH):
-        if path.exists():
-            path.unlink()
-    pose_index = None
-    file_paths = []
-    pose_records = []
-    index_schema_version = POSE_SCHEMA_VERSION
-    return JSONResponse({"message": "Pose index and indexed images cleared."})
+app = create_app()
