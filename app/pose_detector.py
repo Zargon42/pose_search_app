@@ -1,86 +1,94 @@
-import os
-import re
-import sys
-import subprocess
-import tempfile
+import threading
 from pathlib import Path
-from typing import Optional
 
-from PIL import Image
+import mediapipe as mp
 import numpy as np
+from PIL import Image
 
-BASE_DIR = Path(__file__).resolve().parent
-REPO_DIR = BASE_DIR.parent / "bizarre-pose-estimator"
+
+MODEL_PATH = Path(__file__).resolve().parent / "pose_landmarker.task"
+MAX_POSES = 8
+MAX_IMAGE_SIDE = 1280
 
 
 def normalize_pose(coords: np.ndarray) -> np.ndarray:
     if coords.size == 0:
-        return coords
-    coords = coords.reshape(-1, 2)
-    center = coords.mean(axis=0)
-    coords = coords - center
-    scale = np.max(np.linalg.norm(coords, axis=1))
+        return coords.astype(np.float32)
+    coords = coords.reshape(-1, 2).astype(np.float32)
+    coords -= coords.mean(axis=0)
+    scale = float(np.max(np.linalg.norm(coords, axis=1)))
     if scale > 0:
-        coords = coords / scale
+        coords /= scale
     return coords.flatten()
 
 
-def extract_pose_vector_bizarre(image: Image.Image) -> Optional[np.ndarray]:
-    """Run the external bizarre-pose-estimator script to extract keypoints.
+class PoseDetector:
+    def __init__(self, model_path: Path = MODEL_PATH) -> None:
+        self._model_path = model_path
+        self._detector = None
+        self._lock = threading.Lock()
 
-    Requirements / expectations:
-    - The upstream repo must be cloned to the workspace root at `bizarre-pose-estimator`.
-    - An environment variable `BIZARRE_MODEL` must point to the model checkpoint path
-      (relative to the bizarre repo or absolute).
-
-    This function saves the image to a temporary file, runs the estimator as a subprocess,
-    parses stdout for printed keypoints, and returns the normalized vector.
-    """
-    model_path = os.environ.get("BIZARRE_MODEL")
-    if not model_path:
-        raise RuntimeError("BIZARRE_MODEL env var not set; cannot use bizarre estimator")
-
-    if not REPO_DIR.exists():
-        raise RuntimeError(f"Expected bizarre repo at {REPO_DIR} but not found")
-
-    # Save image to temporary PNG file
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tf:
-        tmp_path = Path(tf.name)
-    try:
-        image.save(tmp_path)
-
-        env = os.environ.copy()
-        env.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
-
-        cmd = [sys.executable, "-m", "_scripts.pose_estimator", str(tmp_path), model_path]
-        try:
-            proc = subprocess.run(
-                cmd,
-                cwd=str(REPO_DIR),
-                capture_output=True,
-                text=True,
-                check=True,
-                timeout=240,
-                env=env,
+    def _get_detector(self):
+        if self._detector is None:
+            if not self._model_path.is_file():
+                raise FileNotFoundError(f"MediaPipe pose model not found: {self._model_path}")
+            options = mp.tasks.vision.PoseLandmarkerOptions(
+                base_options=mp.tasks.BaseOptions(model_asset_path=str(self._model_path)),
+                num_poses=MAX_POSES,
+                min_pose_detection_confidence=0.3,
+                min_pose_presence_confidence=0.3,
+                output_segmentation_masks=False,
             )
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"bizarre estimator failed: {e.stderr}") from e
+            self._detector = mp.tasks.vision.PoseLandmarker.create_from_options(options)
+        return self._detector
 
-        out = proc.stdout
-        # The script prints a block starting with 'keypoints' then lines with '(x, y) <label>'
-        coords = []
-        for m in re.finditer(r"\((-?\d+\.\d+),\s*(-?\d+\.\d+)\)", out):
-            x = float(m.group(1))
-            y = float(m.group(2))
-            coords.extend([x, y])
+    def warm_up(self) -> None:
+        self.detect(Image.new("RGB", (256, 256), "white"))
 
-        if len(coords) == 0:
-            return None
+    def detect(self, image: Image.Image) -> list[tuple[np.ndarray, tuple[float, float, float, float]]]:
+        rgb = image.convert("RGB")
+        if max(rgb.size) > MAX_IMAGE_SIDE:
+            scale = MAX_IMAGE_SIDE / max(rgb.size)
+            rgb = rgb.resize((round(rgb.width * scale), round(rgb.height * scale)), Image.Resampling.LANCZOS)
 
-        vec = np.array(coords, dtype=np.float32)
-        return normalize_pose(vec)
-    finally:
-        try:
-            tmp_path.unlink()
-        except Exception:
-            pass
+        image_array = np.asarray(rgb)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_array)
+
+        with self._lock:
+            result = self._get_detector().detect(mp_image)
+
+        detections = []
+        for landmarks in result.pose_landmarks or []:
+            coords = np.array([(landmark.x, landmark.y) for landmark in landmarks], dtype=np.float32)
+            bounds = (
+                float(np.clip(coords[:, 0].min(), 0, 1)),
+                float(np.clip(coords[:, 1].min(), 0, 1)),
+                float(np.clip(coords[:, 0].max(), 0, 1)),
+                float(np.clip(coords[:, 1].max(), 0, 1)),
+            )
+            detections.append((normalize_pose(coords), bounds))
+        return detections
+
+    def close(self) -> None:
+        with self._lock:
+            if self._detector is not None:
+                self._detector.close()
+                self._detector = None
+
+
+_pose_detector = PoseDetector()
+
+
+def extract_pose_detections(
+    image: Image.Image,
+) -> list[tuple[np.ndarray, tuple[float, float, float, float]]]:
+    return _pose_detector.detect(image)
+
+
+def extract_pose_vectors(image: Image.Image) -> list[np.ndarray]:
+    return [vector for vector, _ in extract_pose_detections(image)]
+
+
+def extract_pose_vector(image: Image.Image) -> np.ndarray | None:
+    vectors = extract_pose_vectors(image)
+    return vectors[0] if vectors else None
