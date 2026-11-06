@@ -1,37 +1,71 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Upload - Pose Search App</title>
-  <link rel="stylesheet" href="/static/styles.css" />
-</head>
-<body>
-  <nav class="navbar">
-    <div class="nav-container">
-      <a href="/" class="nav-title">Pose Search</a>
-      <div class="nav-links">
-        <a href="/" class="nav-link">Search</a>
-        <a href="/upload" class="nav-link active">Upload</a>
-      </div>
-    </div>
-  </nav>
-  <main class="container">
-    <h1>Upload Images</h1>
-    <p>Upload images of people to add to the pose database index.</p>
-    <form id="upload-form">
-      <input type="file" id="image-input" accept="image/*" />
-      <button type="submit">Upload & Index</button>
+{% extends 'base.html' %}
+{% block title %}My library · Pose Library{% endblock %}
+{% block content %}
+<div class="eyebrow">Your personal collection</div><h1>Build your pose library.</h1>
+<p class="intro">Bring your own pages. Check the crops and skeletons, then add the panels you want to search.</p>
+<p id="error" class="error hidden" role="alert"></p>
+<div class="library-layout">
+  <aside class="surface sidebar">
+    <label>Collection<select id="dataset-select"><option value="">Choose a collection</option></select></label>
+    <p id="dataset-summary" class="small muted"></p>
+    <div class="actions"><button id="new-dataset" class="secondary" type="button">New collection</button></div>
+    <form id="dataset-form" class="hidden">
+      <h2 id="dataset-form-title">New collection</h2>
+      <label>Name<input name="name" required maxlength="200" placeholder="My manga references"></label>
+      <label>Source URL or reference<input name="source_url" maxlength="2000" placeholder="Optional"></label>
+      <label>License / permission<input name="license" maxlength="2000" placeholder="Unknown, or your source's terms"></label>
+      <label>Attribution<input name="attribution" maxlength="2000" placeholder="Creator / publisher"></label>
+      <label>Notes<textarea name="notes" rows="2" maxlength="10000"></textarea></label>
+      <div class="actions"><button type="submit">Save collection</button><button id="cancel-dataset" type="button" class="secondary">Cancel</button></div>
     </form>
-    <div class="button-group">
-      <button id="clear-btn" class="btn-danger">Clear Index</button>
-    </div>
-    <section id="result" class="hidden">
-      <h2>Upload Successful</h2>
-      <p id="result-message"></p>
+    <div id="dataset-actions" class="actions hidden"><button id="edit-dataset" type="button" class="secondary">Edit details</button><button id="delete-dataset" type="button" class="danger-link">Delete</button></div>
+  </aside>
+  <div class="library-main">
+    <section id="import-section" class="surface hidden">
+      <h2>Import pages</h2><p class="small muted">PDFs, images, or CBZ/ZIP archives. New panels stay in review until you accept them.</p>
+      <form id="import-form">
+        <label>Files<input id="files-input" type="file" multiple accept=".pdf,.zip,.cbz,.jpg,.jpeg,.png,.webp,.bmp,.gif,.tif,.tiff"></label>
+        <label>Or choose a folder<input id="folder-input" type="file" webkitdirectory multiple></label>
+        <p id="selected-files" class="small muted"></p>
+        <div class="actions"><button id="import-button" type="submit">Import & find panels</button></div>
+      </form>
+      <p id="upload-status" role="status"></p>
+      <div class="actions"><button id="accept-detected" type="button" class="secondary">Accept detected panels</button></div>
+      <p class="small muted">Accept pending panels with detected figures in this collection. Exact duplicate panel images are skipped.</p>
+      <div class="actions"><button id="redetect-collection" type="button" class="secondary">Re-detect unreviewed panels</button></div>
+      <p class="small muted">Use the improved drawing detector on existing crops. Accepted, skipped, tagged, and newly corrected panels are kept.</p>
     </section>
-    <section id="error" class="hidden"></section>
-  </main>
-  <script src="/static/upload.js"></script>
-</body>
-</html>
+    <section id="jobs-section" class="surface hidden" aria-label="Import progress"><h2>Imports</h2><div id="jobs-list" aria-live="polite"></div></section>
+  </div>
+</div>
+<section id="review-section" class="hidden">
+  <div class="section-heading"><h2>Panels</h2><label>Show<select id="status-filter"><option value="pending">Needs review</option><option value="accepted">Accepted</option><option value="skipped">Skipped</option></select></label></div>
+  <p id="panel-summary" class="muted" role="status"></p><div id="panel-list" class="panel-grid"></div>
+  <div class="actions"><button id="prev-page" type="button" class="secondary">Previous</button><button id="next-page" type="button" class="secondary">Next</button></div>
+</section>
+<dialog id="review-dialog" aria-labelledby="review-title">
+  <div class="dialog-header"><h2 id="review-title">Review panel</h2><button id="close-review" type="button" class="secondary" aria-label="Close panel review">Close</button></div>
+  <p id="review-source" class="small muted"></p>
+  <p id="review-error" class="error hidden" role="alert"></p>
+  <div class="editor-layout">
+    <div><div class="canvas-wrap"><canvas id="review-canvas" tabindex="0" aria-label="Source page with editable skeleton joints. Drag joints to correct a pose; crop can also be entered in the fields."></canvas></div><p id="editor-hint" class="small muted">Drag a joint to correct it. Skeleton coordinates are also available below.</p></div>
+    <form id="review-form">
+      <fieldset><legend>Panel crop (page pixels)</legend><div class="bounds-grid">
+        <label>Left<input id="crop-left" type="number" min="0" required></label><label>Top<input id="crop-top" type="number" min="0" required></label>
+        <label>Right<input id="crop-right" type="number" min="1" required></label><label>Bottom<input id="crop-bottom" type="number" min="1" required></label>
+      </div><div class="actions"><button id="draw-crop" type="button" class="secondary">Draw crop</button><button id="redetect" type="button" class="secondary">Re-detect</button><button id="add-panel" type="button" class="secondary">Save crop as another panel</button></div></fieldset>
+      <fieldset><legend>Figures</legend>
+        <label>Selected skeleton<select id="pose-select"></select></label>
+        <div class="actions"><button id="add-pose" type="button" class="secondary">Add skeleton</button><button id="remove-pose" type="button" class="danger-link">Remove skeleton</button></div>
+        <label class="toggle"><input id="show-uncertain" type="checkbox">Show uncertain joints</label>
+        <details><summary>Edit joint coordinates</summary><label>Joint<select id="joint-select"></select></label><p id="joint-confidence" class="small muted"></p><div class="bounds-grid"><label>X<input id="joint-x" type="number" step="any"></label><label>Y<input id="joint-y" type="number" step="any"></label></div><button id="set-joint" type="button" class="secondary">Set joint</button></details>
+      </fieldset>
+      <label>Total people in panel<input id="participant-count" type="number" min="0" max="64" required></label>
+      <div id="gender-tags" class="tag-grid"></div><p class="small muted">Tags describe characters. Unknown stays unknown until you choose a tag.</p>
+      <label>Panel notes<textarea id="panel-notes" rows="2" maxlength="10000"></textarea></label>
+      <div class="actions"><button id="accept-panel" type="submit">Accept & index</button><button id="save-panel" type="button" class="secondary">Save changes</button><button id="skip-panel" type="button" class="danger-link">Skip panel</button></div>
+    </form>
+  </div>
+</dialog>
+{% endblock %}
+{% block scripts %}<script type="module" src="/static/upload.js"></script>{% endblock %}

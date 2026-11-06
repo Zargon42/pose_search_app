@@ -1,45 +1,37 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Pose Search App</title>
-  <link rel="stylesheet" href="/static/styles.css" />
-</head>
-<body>
-  <nav class="navbar">
-    <div class="nav-container">
-      <a href="/" class="nav-title">Pose Search</a>
-      <div class="nav-links">
-        <a href="/" class="nav-link active">Search</a>
-        <a href="/upload" class="nav-link">Upload</a>
+{% extends 'base.html' %}
+{% block title %}Find a pose · Pose Library{% endblock %}
+{% block content %}
+<div class="eyebrow">A reference for your next pose</div>
+<h1>From real life<br>to the page.</h1>
+<p class="intro">Find manga figures with a pose like yours, or explore your collection for inspiration.</p>
+<section class="surface">
+  <form id="search-form">
+    <div class="search-layout">
+      <div>
+        <label for="image-input">Your photo <span class="muted">(optional for browsing)</span></label>
+        <input id="image-input" type="file" accept="image/*">
+        <p class="small muted">A clear view of the body works best. Search photos are not added to your library.</p>
+        <img id="query-preview" class="query-preview hidden" alt="Your selected photo">
+      </div>
+      <div class="filters">
+        <label>Collection<select id="dataset-filter"><option value="">All collections</option></select></label>
+        <label>People in the panel<input id="count-filter" type="number" min="0" max="64" placeholder="Any number"></label>
+        <label>Panel includes a character tagged<select id="gender-filter">
+          <option value="">Any gender</option><option value="male">Male</option><option value="female">Female</option>
+          <option value="nonbinary">Nonbinary</option><option value="other">Other</option><option value="unknown">Unknown</option>
+        </select></label>
       </div>
     </div>
-  </nav>
-  <main class="container">
-    <h1>Pose Search</h1>
-    <p>Upload an image of a person and find the closest pose match from the indexed database.</p>
-    <form id="upload-form">
-      <input type="file" id="image-input" accept="image/*" />
-      <button type="submit">Search</button>
-    </form>
-    <section id="result" class="hidden">
-      <h2>Search Results</h2>
-      <div class="results-container">
-        <div class="result-column">
-          <h3>Your Image</h3>
-          <img id="uploaded-image" src="" alt="Uploaded image" />
-        </div>
-        <div class="result-column">
-          <h3>Best Match</h3>
-          <img id="result-image" src="" alt="Best match" />
-          <p id="result-file"></p>
-          <p id="result-distance"></p>
-        </div>
-      </div>
-    </section>
-    <section id="error" class="hidden"></section>
-  </main>
-  <script src="/static/app.js"></script>
-</body>
-</html>
+    <div class="actions"><button id="search-button" type="submit">Match my pose</button><button id="browse-button" type="button" class="secondary">Suggest poses</button></div>
+  </form>
+</section>
+<p id="error" class="error hidden" role="alert"></p>
+<p id="search-status" role="status" aria-live="polite"></p>
+<section id="results-section" class="hidden" aria-label="Pose results">
+  <div class="section-heading"><h2 id="results-heading">Your matches</h2><span id="rank-note" class="small muted">Lower distance means a closer pose</span></div>
+  <div id="match-list" class="panel-grid"></div>
+  <div class="actions"><button id="more-button" type="button" class="secondary hidden">More suggestions</button></div>
+</section>
+<div id="empty-library" class="empty hidden"><h2>Start with your own collection</h2><p>Import PDFs, page images, or CBZ/ZIP files. Review a few panels, then come back to find a pose.</p><a class="button" href="/library">Build my library</a></div>
+{% endblock %}
+{% block scripts %}<script type="module" src="/static/app.js"></script>{% endblock %}

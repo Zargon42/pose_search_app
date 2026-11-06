@@ -1,0 +1,15 @@
+{% extends 'base.html' %}
+{% block title %}Page tools · Pose Library{% endblock %}
+{% block content %}
+<div class="eyebrow">Single-page utilities</div><h1>Explore a page.</h1>
+<p class="intro">Preview automatic panel boundaries, search a page, or index its detected poses. For batch imports and manual review, use <a href="/library">My library</a>.</p>
+<section class="surface">
+  <form id="page-form"><label for="page-input">Manga page image</label><input type="file" id="page-input" accept="image/*">
+    <div class="actions"><button type="button" id="segment-btn">Segment panels</button><button type="button" id="search-btn" class="secondary">Search poses</button><button type="button" id="index-btn" class="secondary">Index detected poses</button></div>
+  </form><p id="page-status" role="status"></p>
+</section>
+<section id="page-preview-section" class="hidden"><h2>Page preview</h2><div class="page-image-wrap"><img id="page-preview" alt="Selected manga page"><canvas id="page-overlay"></canvas></div></section>
+<section id="page-results" class="hidden"><h2>Pose matches</h2><ol id="match-list" class="match-list"></ol></section>
+<p id="error" class="error hidden" role="alert"></p>
+{% endblock %}
+{% block scripts %}<script src="/static/full_page.js"></script>{% endblock %}
