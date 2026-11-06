@@ -198,6 +198,11 @@ def create_app(data_dir=None, warm_up=True):
         catalog.delete_dataset(dataset_id)
         return {"message": "Dataset and its rendered pages deleted."}
 
+    @application.post("/api/datasets/{dataset_id}/accept-detected")
+    def accept_detected_panels(dataset_id: str):
+        catalog.dataset(dataset_id)
+        return catalog.accept_detected_panels(dataset_id)
+
     @application.post("/api/datasets/{dataset_id}/imports", status_code=202, openapi_extra={
         "requestBody": {"required": True, "content": {"multipart/form-data": {"schema": {
             "type": "object", "required": ["files"], "properties": {

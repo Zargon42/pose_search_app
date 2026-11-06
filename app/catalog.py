@@ -1,5 +1,6 @@
 """SQLite is the source of truth; only rendered source pages live on disk."""
 
+import hashlib
 import json
 import sqlite3
 import uuid
@@ -225,6 +226,70 @@ class Catalog:
             if poses is not None:
                 db.execute("DELETE FROM poses WHERE panel_id=?", (panel_id,))
                 self._insert_poses(db, panel_id, poses)
+
+    def _panel_image_hashes(self, panels):
+        current_page_id = None
+        page_image = None
+        try:
+            for row in panels:
+                if row["page_id"] != current_page_id:
+                    if page_image is not None:
+                        page_image.close()
+                    page_image = Image.open(self.assets / row["image_name"])
+                    current_page_id = row["page_id"]
+                crop = page_image.crop(tuple(json.loads(row["bounds"]))).convert("RGB")
+                digest = hashlib.sha256()
+                digest.update(crop.width.to_bytes(4, "big"))
+                digest.update(crop.height.to_bytes(4, "big"))
+                digest.update(crop.tobytes())
+                yield row["id"], digest.digest()
+        finally:
+            if page_image is not None:
+                page_image.close()
+
+    def accept_detected_panels(self, dataset_id):
+        with self.connect() as db:
+            pending_count = db.execute("""
+                SELECT COUNT(*) FROM panels p JOIN pages pg ON pg.id=p.page_id
+                WHERE pg.dataset_id=? AND p.status='pending'
+            """, (dataset_id,)).fetchone()[0]
+            accepted = db.execute("""
+                SELECT p.id,p.bounds,pg.id AS page_id,pg.image_name FROM panels p
+                JOIN pages pg ON pg.id=p.page_id WHERE p.status='accepted'
+                ORDER BY pg.rowid,p.rowid
+            """).fetchall()
+            candidates = db.execute("""
+                SELECT p.id,p.bounds,pg.id AS page_id,pg.image_name FROM panels p
+                JOIN pages pg ON pg.id=p.page_id
+                WHERE pg.dataset_id=? AND p.status='pending'
+                AND EXISTS(SELECT 1 FROM poses ps WHERE ps.panel_id=p.id)
+                ORDER BY pg.rowid,p.rowid
+            """, (dataset_id,)).fetchall()
+
+        known_hashes = {
+            image_hash for _, image_hash in self._panel_image_hashes(accepted)
+        }
+        accepted_count = duplicate_count = 0
+        candidate_hashes = list(self._panel_image_hashes(candidates))
+        with self.connect() as db:
+            for panel_id, image_hash in candidate_hashes:
+                if image_hash in known_hashes:
+                    duplicate_count += 1
+                    continue
+                updated = db.execute(
+                    "UPDATE panels SET status='accepted' WHERE id=? AND status='pending'",
+                    (panel_id,),
+                ).rowcount
+                if updated:
+                    known_hashes.add(image_hash)
+                    accepted_count += 1
+                else:
+                    duplicate_count += 1
+        return {
+            "accepted": accepted_count,
+            "duplicates_skipped": duplicate_count,
+            "without_poses": pending_count - len(candidates),
+        }
 
     def search(self, vectors, dataset_id=None, participant_count=None, gender=None, limit=12, *, query_scores=None, query_dimensions=None):
         # Rank figures, then keep only the closest figure from each panel.

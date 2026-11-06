@@ -117,6 +117,39 @@ class LibraryTests(unittest.TestCase):
         self.assertEqual(self.client.patch(path, json={"status": "skipped"}).status_code, 200)
         self.assertEqual(self.client.get("/api/panels").json()["total"], 0)
 
+    def test_bulk_accept_skips_exact_duplicate_panels_and_panels_without_poses(self):
+        other_dataset = self.catalog.create_dataset("Other collection")
+        repeated_image = Image.new("RGB", (120, 160), "white")
+        unique_image = Image.new("RGB", (120, 160), "black")
+        pose = {"vector": np.zeros(66, dtype=np.float32)}
+        self.catalog.add_page(other_dataset, "accepted.png", 1, repeated_image,
+                              [{"bounds": [0, 0, 120, 160], "poses": [pose]}], "accepted")
+        duplicate_id = self.catalog.add_page(
+            self.dataset, "duplicate.png", 1, repeated_image,
+            [{"bounds": [0, 0, 120, 160], "poses": [pose]}],
+        )[0]
+        unique_id, repeated_id = self.catalog.add_page(
+            self.dataset, "new.png", 1, unique_image,
+            [{"bounds": [0, 0, 120, 160], "poses": [pose]},
+             {"bounds": [0, 0, 120, 160], "poses": [pose]}],
+        )
+        no_pose_id = self.catalog.add_page(
+            self.dataset, "missed.png", 1, Image.new("RGB", (120, 160), "gray"),
+            [{"bounds": [0, 0, 120, 160], "poses": []}],
+        )[0]
+
+        response = self.client.post(f"/api/datasets/{self.dataset}/accept-detected")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {
+            "accepted": 1,
+            "duplicates_skipped": 2,
+            "without_poses": 1,
+        })
+        self.assertEqual(self.catalog.panel(unique_id)["status"], "accepted")
+        for panel_id in (duplicate_id, repeated_id, no_pose_id):
+            self.assertEqual(self.catalog.panel(panel_id)["status"], "pending")
+        self.assertEqual(self.client.get("/api/panels?status=accepted").json()["total"], 2)
+
     def test_search_ranks_figures_deduplicates_panels_and_does_not_save_queries(self):
         vector = np.arange(66, dtype=np.float32) / 100
         other = vector + 1

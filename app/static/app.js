@@ -46,7 +46,10 @@ async function browse(append = false) {
 $('search-form').addEventListener('submit', async event => {
   event.preventDefault();
   if (!$('image-input').files.length) {
-    showError(new Error('Choose a photo to match, or use Suggest poses to browse without a photo.')); return;
+    $('search-status').textContent = 'Choose a photo before matching, or use Suggest poses to browse without one.';
+    showError(new Error('No photo selected.'));
+    $('image-input').focus();
+    return;
   }
   busy(true); $('error').classList.add('hidden'); $('more-button').classList.add('hidden');
   $('results-section').classList.add('hidden');
@@ -62,18 +65,20 @@ $('search-form').addEventListener('submit', async event => {
     $('results-section').classList.remove('hidden');
     $('search-status').textContent = data.matches.length
       ? `${data.matches.length} closest panel(s). Each compares an individual figure, including figures in group panels.`
-      : 'No accepted panels fit these filters. Try fewer filters or accept panels in My library.';
+      : 'No matches found. Check that your collection has accepted panels, loosen the filters, or choose a photo showing more of the body.';
   } catch (error) { showError(error); $('search-status').textContent = ''; }
   finally { busy(false); }
 });
 
 $('image-input').addEventListener('change', () => {
+  $('error').classList.add('hidden');
   if (queryUrl) URL.revokeObjectURL(queryUrl);
   const file = $('image-input').files[0];
   queryUrl = file ? URL.createObjectURL(file) : null;
   $('query-preview').classList.toggle('hidden', !file);
   if (file) $('query-preview').src = queryUrl;
   else $('query-preview').removeAttribute('src');
+  $('search-status').textContent = file ? 'Photo ready. Choose Match my pose to search accepted panels.' : '';
 });
 $('browse-button').addEventListener('click', () => browse());
 $('more-button').addEventListener('click', () => browse(true));

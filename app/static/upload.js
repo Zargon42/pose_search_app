@@ -42,6 +42,7 @@ async function loadDatasets(prefer = selectedDataset) {
   $('dataset-select').value = selectedDataset;
   const dataset = currentDataset();
   $('dataset-summary').textContent = dataset ? `${dataset.page_count} pages · ${dataset.accepted_count} accepted · ${dataset.pending_count} to review` : 'Your library starts empty. Add your own sources.';
+  $('accept-detected').disabled = !dataset?.pending_count;
   for (const id of ['import-section', 'dataset-actions', 'review-section']) $(id).classList.toggle('hidden', !dataset);
 }
 
@@ -112,6 +113,22 @@ $('import-form').addEventListener('submit', event => {
     } finally { $('import-button').disabled = false; }
   });
 });
+
+$('accept-detected').addEventListener('click', () => run(async () => {
+  const dataset = currentDataset();
+  if (!dataset || !confirm(`Accept pending panels in “${dataset.name}” that have at least one detected figure? Panels with an exactly identical crop already accepted anywhere in your library, or earlier in this batch, will be skipped. Panels without detected figures will remain pending.`)) return;
+  clearError();
+  $('accept-detected').disabled = true;
+  try {
+    const result = await api(`/api/datasets/${selectedDataset}/accept-detected`, { method: 'POST' });
+    $('upload-status').textContent = `Accepted ${result.accepted} panel(s); skipped ${result.duplicates_skipped} exact duplicate(s) and left ${result.without_poses} panel(s) without detected figures for review.`;
+    offset = 0;
+    await loadDatasets();
+    await loadPanels();
+  } finally {
+    $('accept-detected').disabled = !currentDataset()?.pending_count;
+  }
+}));
 
 $('redetect-collection').addEventListener('click', () => run(async () => {
   if (!confirm('Replace automatic skeletons in unreviewed panels using the improved drawing detector? Accepted, skipped, tagged, and newly corrected panels are kept. Previously edited pending panels without tags or notes may also be replaced. A local catalog backup is saved first.')) return;

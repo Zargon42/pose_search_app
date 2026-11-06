@@ -25,6 +25,8 @@ Open [http://127.0.0.1:8000](http://127.0.0.1:8000). Run one server worker per l
 5. Correct joints by dragging them on the source page or editing their coordinates. Only confident joints are shown by default; **Show uncertain joints** reveals the remaining estimates. Setting or dragging a joint marks it as trusted. Add a skeleton for a missed figure, or remove false detections. Set the total participant count, which may include figures without complete skeletons. Gender tags describe characters and default to unknown.
 6. **Accept & index** makes a panel searchable. **Save changes** keeps its current status. **Skip panel** removes it from search; skipped panels remain editable.
 
+In **My library**, **Accept detected panels** bulk-accepts pending panels in the selected collection that contain at least one detected figure. It skips panels whose cropped pixels exactly match an accepted panel anywhere in the library or an earlier panel accepted by that bulk action. Panels without detected figures remain pending for review.
+
 Imports accept up to 20,000 files, 1 GiB per file, and 4 GiB per batch. Archive images are limited to 100 MiB each, source images to 40 megapixels, PDFs to 10,000 pages, and image archives to 20,000 pages. PDF pages render at up to 2× scale with a 2,000-pixel longest side. Animated/multipage image files use their first frame. No source PDF or archive is retained after import; rendered page images and provenance are retained.
 
 Re-detection replaces skeletons and resets character tags to unknown; the UI asks before replacing those edits.
@@ -60,6 +62,7 @@ Interactive documentation is available at `/docs`.
 | `GET /api/datasets`, `POST /api/datasets` | List or create collections with provenance |
 | `PATCH /api/datasets/{id}`, `DELETE /api/datasets/{id}` | Edit details or delete a collection |
 | `POST /api/datasets/{id}/imports` | Multipart `files` uploads; returns a background import job |
+| `POST /api/datasets/{id}/accept-detected` | Bulk-accept detected pending panels, skipping exact cropped-image duplicates |
 | `POST /api/datasets/{id}/redetect` | Re-detect eligible unreviewed panels; returns a cancellable job |
 | `GET /api/imports`, `GET /api/imports/{id}` | Import progress and warnings |
 | `POST /api/imports/{id}/cancel` | Request cancellation |
